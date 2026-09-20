@@ -307,6 +307,80 @@ export function groupConversation(messages: ChatMessage[]): ConversationGroup[] 
   return groups;
 }
 
+/**
+ * 增量分组的缓存：已完结的轮次（最后一条真实用户消息之前的部分）不再重算，
+ * 流式 token 只影响尾部分组。
+ */
+export interface ConversationGroupCache {
+  /** 前缀覆盖到 messages 的哪个下标（最后一条用户消息的位置）。 */
+  boundary: number;
+  prefixMessages: ChatMessage[];
+  prefixGroups: ConversationGroup[];
+}
+
+export interface ConversationGroupResult {
+  groups: ConversationGroup[];
+  /** 已稳定历史段长度（prefixGroups）；流式发生在这个下标之后。 */
+  liveStart: number;
+  cache: ConversationGroupCache;
+}
+
+function lastUserMessageIndex(messages: ChatMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]!.role === "user") return index;
+  }
+  return -1;
+}
+
+function sameMessagePrefix(left: ChatMessage[], right: ChatMessage[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
+  }
+  return true;
+}
+
+/**
+ * 分组 + 增量缓存：长会话里每帧重建全部分组（数组与对象）是流式期间的主要 GC 与重渲染压力来源。
+ * 边界取「最后一条真实用户消息」：之前的轮次已定型，只有尾部还在长。
+ * 用消息数组的元素引用判断前缀是否变化（applyAgentEvent 只替换尾部消息，前缀引用保持不变）。
+ */
+export function nextConversationGroups(
+  messages: ChatMessage[],
+  cache: ConversationGroupCache | undefined,
+): ConversationGroupResult {
+  const boundary = lastUserMessageIndex(messages);
+
+  if (boundary === -1) {
+    const groups = groupConversation(messages);
+    return { groups, liveStart: 0, cache: { boundary: -1, prefixMessages: [], prefixGroups: [] } };
+  }
+
+  const prefixMessages = messages.slice(0, boundary);
+  let prefixGroups: ConversationGroup[];
+  if (cache && cache.boundary === boundary) {
+    prefixGroups = sameMessagePrefix(prefixMessages, cache.prefixMessages)
+      ? cache.prefixGroups
+      : groupConversation(prefixMessages);
+  } else if (cache && cache.boundary >= 0 && boundary > cache.boundary) {
+    // 轮次推进：旧前缀 + 中间整段（旧尾）直接拼接，只对新增片段分组
+    const middle = messages.slice(cache.boundary, boundary);
+    prefixGroups = sameMessagePrefix(messages.slice(0, cache.boundary), cache.prefixMessages)
+      ? [...cache.prefixGroups, ...groupConversation(middle)]
+      : groupConversation(prefixMessages);
+  } else {
+    prefixGroups = groupConversation(prefixMessages);
+  }
+
+  const tailGroups = groupConversation(messages.slice(boundary));
+  const groups = prefixGroups.length > 0 ? [...prefixGroups, ...tailGroups] : tailGroups;
+  return {
+    groups,
+    liveStart: prefixGroups.length,
+    cache: { boundary, prefixMessages, prefixGroups },
+  };
+}
+
 export function turnAnchorId(id: string): string {
   return `turn-${id}`;
 }

@@ -43,8 +43,9 @@ import {
   assistantGroupHasRecoverableError,
   assistantGroupSucceeded,
   assistantReplyText,
-  groupConversation,
+  nextConversationGroups,
   recoverableFailStreaks,
+  type ConversationGroupCache,
   lastTurnRestoreFiles,
   mentionedFiles,
   normalizeMessages,
@@ -57,6 +58,7 @@ import {
   turnAnchorId,
   turnAnchors,
   type ChatMessage,
+  type ConversationGroup,
   type FileChange,
   type RestoreFile,
 } from "./conversation";
@@ -637,7 +639,53 @@ export function App() {
     void window.harness.agent.command("set_thinking_level", { level: next }, sessionRef.current).catch(() => undefined);
   }, []);
 
-  const groups = useMemo(() => groupConversation(messages), [messages]);
+  const groupCache = useRef<ConversationGroupCache | undefined>(undefined);
+  // 增量分组：已完结的轮次复用上一帧的 group 对象，流式 token 只重算尾部（对齐 Proma 的
+  // “稳定前缀 + live tail”），否则每个 token 都会重建全部 group 对象并让上游 memo 全部失效。
+  const grouped = useMemo(() => {
+    const next = nextConversationGroups(messages, groupCache.current);
+    groupCache.current = next.cache;
+    return next;
+  }, [messages]);
+  const groups = grouped.groups;
+  const liveStart = grouped.liveStart;
+
+  /**
+   * 分段渲染：历史段与「当前轮」分开。历史段的 group 引用稳定，配合 memo 行组件整段跳过重渲染；
+   * 流式 token 只影响尾段（Proma 的 AgentMessages 也是这个结构，而不是把整段 DOM 虚拟化）。
+   */
+  const renderTurns = (slice: ConversationGroup[], offset: number) =>
+    slice.map((group, index) => {
+      const position = offset + index;
+      if (group.type === "user") {
+        return (
+          <UserTurn
+            key={group.id}
+            anchor={turnAnchorId(group.id)}
+            text={group.message.text}
+            images={group.message.images}
+          />
+        );
+      }
+      const recovered = assistantErrorRecovered(group.messages, groups, position);
+      const isLastGroup = position === groups.length - 1;
+      const showRetry = !running && isLastGroup
+        && assistantGroupHasRecoverableError(group.messages)
+        && !recovered
+        && !assistantGroupSucceeded(group.messages);
+      return (
+        <AssistantTurn
+          key={group.id}
+          messages={group.messages}
+          errorRecovered={recovered}
+          recoverableFailStreak={recoverableStreaks[position] ?? 0}
+          onOpenFile={setPreview}
+          onRetry={showRetry ? () => {
+            void sendMessage(t("composer.retryContinue"));
+          } : undefined}
+        />
+      );
+    });
   const recoverableStreaks = useMemo(() => recoverableFailStreaks(groups), [groups]);
   const anchors = useMemo(() => turnAnchors(groups), [groups]);
   const tools = useMemo(() => sessionTools(messages), [messages]);
@@ -2286,36 +2334,8 @@ export function App() {
           )}
           {groups.length > 0 && (
             <div className="messages">
-              {groups.map((group, index) => {
-                if (group.type === "user") {
-                  return (
-                    <UserTurn
-                      key={group.id}
-                      anchor={turnAnchorId(group.id)}
-                      text={group.message.text}
-                      images={group.message.images}
-                    />
-                  );
-                }
-                const recovered = assistantErrorRecovered(group.messages, groups, index);
-                const isLastGroup = index === groups.length - 1;
-                const showRetry = !running && isLastGroup
-                  && assistantGroupHasRecoverableError(group.messages)
-                  && !recovered
-                  && !assistantGroupSucceeded(group.messages);
-                return (
-                  <AssistantTurn
-                    key={group.id}
-                    messages={group.messages}
-                    errorRecovered={recovered}
-                    recoverableFailStreak={recoverableStreaks[index] ?? 0}
-                    onOpenFile={setPreview}
-                    onRetry={showRetry ? () => {
-                      void sendMessage(t("composer.retryContinue"));
-                    } : undefined}
-                  />
-                );
-              })}
+              {renderTurns(groups.slice(0, liveStart), 0)}
+              {renderTurns(groups.slice(liveStart), liveStart)}
               {waiting && (
                 <article className="turn">
                   <div className="turn-trace">
