@@ -280,8 +280,13 @@ async function resolveUpdate(): Promise<UpdateCheckResult> {
 }
 
 /** Startup stays silent and only announces availability; the renderer owns the update surface. */
+function updatesDisabledByLocalPatches(): boolean {
+  return process.env.TETHER_ALLOW_UPDATES !== "1";
+}
+
 async function checkForUpdatesOnStartup(): Promise<void> {
   if (!app.isPackaged || updateCheckStarted) return;
+  if (updatesDisabledByLocalPatches()) return;
   updateCheckStarted = true;
   const result = await resolveUpdate();
   if (result.status !== "available") return;
@@ -295,6 +300,11 @@ type DownloadOutcome =
   | { ok: false; cancelled?: boolean; error?: string };
 
 async function startUpdateDownload(): Promise<DownloadOutcome> {
+  // 本机构建带有本地补丁（v4-anchor / deepseek 前缀重挂 / retry 兼底），官方安装包会静默覆盖它们。
+  // 需要升级时用 TETHER_ALLOW_UPDATES=1 启动，或手动重打补丁后替换应用。
+  if (updatesDisabledByLocalPatches()) {
+    return { ok: false, error: t(appLocale, "update.localBuild") };
+  }
   if (updateDownloadController)
     return { ok: false, error: t(appLocale, "update.busy") };
 
