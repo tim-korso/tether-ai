@@ -34,6 +34,16 @@ import {
   type SupportedProviderId,
 } from "tether-agent-core";
 import { AgentHostManager } from "./agent-host-manager";
+import {
+  isIgnoredWatchPath,
+  parseWorkspaceIgnore,
+} from "./workspace-ignore";
+import { listWorkspaceFiles } from "./workspace-files";
+import {
+  RENDERER_RECOVERY_WINDOW_MS,
+  canRecoverRenderer,
+  recentRecoveryAttempts,
+} from "./renderer-recovery";
 import { isPathInsideRoot } from "./workspace-path";
 import { listLocalSkills, revealSkillPath } from "./skills-fs";
 import { apiBaseUrl, listOpenAiModels } from "../shared/openai-models";
@@ -406,6 +416,46 @@ async function installDownloadedUpdate(): Promise<UpdateInstallResult> {
   return { ok: true, action: "restarting" };
 }
 
+const RENDERER_UNRESPONSIVE_GRACE_MS = 20_000;
+let rendererRecoveryAttempts: number[] = [];
+let rendererFailureShown = false;
+let rendererUnresponsiveTimer: ReturnType<typeof setTimeout> | undefined;
+
+function loadMainRenderer(): void {
+  const devServer = process.env.VITE_DEV_SERVER_URL;
+  if (devServer) void mainWindow?.loadURL(devServer);
+  else
+    void mainWindow?.loadFile(
+      path.join(currentDirectory, "../../dist/index.html"),
+    );
+}
+
+/** 自愈预算用完后的降级页：不再无限重载，但保留 ⌘R 手动重试的退路。 */
+function showRendererFailure(reason: string): void {
+  rendererFailureShown = true;
+  clearTimeout(rendererUnresponsiveTimer);
+  rendererUnresponsiveTimer = undefined;
+  const safeReason = reason.replace(/[<>&]/g, "").slice(0, 300);
+  const html = `<!doctype html><meta charset="utf-8"><title>Tether</title>
+<body style="font:14px -apple-system,system-ui;margin:0;display:flex;height:100vh;align-items:center;justify-content:center;background:#fafafb;color:#1f2328">
+<div style="max-width:520px;text-align:center">
+<p style="font-size:16px;font-weight:600;margin:0 0 8px">界面进程已连续异常退出</p>
+<p style="margin:0 0 16px;color:#59636e">${safeReason}</p>
+<p style="margin:0;color:#59636e">会话记录已保存在磁盘上，不会丢失。按 ⌘R 重新加载界面，或退出后重新打开应用。</p>
+</div>`;
+  void mainWindow?.loadURL(
+    `data:text/html;charset=utf-8,${encodeURIComponent(html)}`,
+  );
+  mainWindow?.webContents.once("before-input-event", (event, input) => {
+    if (input.type !== "keyDown" || !input.meta) return;
+    if (input.key.toLowerCase() !== "r") return;
+    event.preventDefault();
+    rendererRecoveryAttempts = [];
+    rendererFailureShown = false;
+    loadMainRenderer();
+  });
+}
+
 function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -469,12 +519,65 @@ function createWindow(): void {
     if (url !== mainWindow?.webContents.getURL()) event.preventDefault();
   });
 
-  const devServer = process.env.VITE_DEV_SERVER_URL;
-  if (devServer) void mainWindow.loadURL(devServer);
-  else
-    void mainWindow.loadFile(
-      path.join(currentDirectory, "../../dist/index.html"),
+  // 崩溃/卡死自愈：渲染进程异常退出时在 30s 窗口内最多自动重载 2 次，超限降级为错误页。
+  // 会话数据全在磁盘上，重载后渲染层会重新拉取 runningSessions 与当前会话，不需要主进程重建 run。
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    if (quitting || details.reason === "clean-exit") return;
+    console.error(
+      `[renderer] 异常退出 reason=${details.reason} exitCode=${details.exitCode}`,
     );
+    logPerf(`renderer:gone reason=${details.reason} exitCode=${details.exitCode ?? "unknown"}`);
+    rendererRecoveryAttempts = recentRecoveryAttempts(rendererRecoveryAttempts, Date.now());
+    if (
+      !rendererFailureShown &&
+      canRecoverRenderer(rendererRecoveryAttempts, Date.now())
+    ) {
+      rendererRecoveryAttempts.push(Date.now());
+      setTimeout(() => {
+        if (quitting || !mainWindow || mainWindow.isDestroyed()) return;
+        loadMainRenderer();
+      }, 250);
+      return;
+    }
+    showRendererFailure(
+      `Renderer 进程异常退出（${details.reason}，退出码 ${details.exitCode ?? "unknown"}）`,
+    );
+  });
+
+  // 卡死自愈：先给 20s 复原机会（也可能是长任务），仍无响应就重启渲染进程走重载路径。
+  mainWindow.webContents.on("unresponsive", () => {
+    console.warn("[renderer] 无响应，等待自愈窗口");
+    clearTimeout(rendererUnresponsiveTimer);
+    rendererUnresponsiveTimer = setTimeout(() => {
+      if (quitting || !mainWindow || mainWindow.isDestroyed()) return;
+      console.error("[renderer] 持续无响应，强制重建渲染进程");
+      logPerf("renderer:unresponsive -> forcefullyCrashRenderer");
+      rendererUnresponsiveTimer = undefined;
+      mainWindow.webContents.forcefullyCrashRenderer();
+    }, RENDERER_UNRESPONSIVE_GRACE_MS);
+  });
+  mainWindow.webContents.on("responsive", () => {
+    clearTimeout(rendererUnresponsiveTimer);
+    rendererUnresponsiveTimer = undefined;
+  });
+
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription) => {
+    if (quitting || rendererFailureShown) return;
+    // 开发服务器未起、打包路径缺失等场景：重试一次，再失败就降级
+    console.error(`[renderer] 加载失败 ${errorCode} ${errorDescription}`);
+    const now = Date.now();
+    if (canRecoverRenderer(rendererRecoveryAttempts, now)) {
+      rendererRecoveryAttempts.push(now);
+      setTimeout(() => {
+        if (quitting || rendererFailureShown) return;
+        loadMainRenderer();
+      }, 500);
+      return;
+    }
+    showRendererFailure(`界面加载失败（${errorDescription || errorCode}）`);
+  });
+
+  loadMainRenderer();
 }
 
 function sendAppCommand(command: string): void {
@@ -506,6 +609,100 @@ function installMenu(): void {
       { role: "viewMenu" },
     ]),
   );
+}
+
+const SESSIONS_LIST_TTL_MS = 1_500;
+const SESSIONS_REFRESH_DEBOUNCE_MS = 1_200;
+const SESSIONS_REFRESH_MIN_INTERVAL_MS = 10_000;
+
+let sessionsListCache: { key: string; at: number; rows: SessionSummary[] } | undefined;
+let sessionsRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+let sessionsRefreshTask: Promise<void> | undefined;
+let sessionsLastRefreshAt = 0;
+
+function threadSummary(
+  thread: Awaited<ReturnType<typeof listTetherThreads>>[number],
+): SessionSummary {
+  return {
+    path: thread.sessionPath,
+    storagePath: thread.storagePath,
+    id: thread.id,
+    cwd: thread.cwd,
+    title: visionTitle(thread.title),
+    createdAt: thread.createdAt,
+    updatedAt: thread.updatedAt,
+    ...(thread.provider ? { provider: thread.provider } : {}),
+    ...(thread.model ? { model: thread.model } : {}),
+    messageCount: thread.messageCount,
+    ...(thread.preview ? { preview: thread.preview } : {}),
+    pinned: thread.pinned,
+    archived: thread.archived,
+  };
+}
+
+/**
+ * 会话列表热路径：只读 SQLite 索引表 + 短 TTL 缓存。
+ * 真正的 jsonl 解析（listTetherThreads → refresh → parseSession）成本与文件大小成正比
+ * （实测 71MB 会话 ≈ 1.07s + 285MB 瞬时内存），因此绝不放在 IPC 等待链路上。
+ */
+async function listSessionSummaries(cwd?: string): Promise<SessionSummary[]> {
+  const key = cwd ? path.resolve(cwd) : "";
+  const cached = sessionsListCache;
+  if (cached && cached.key === key && Date.now() - cached.at < SESSIONS_LIST_TTL_MS) {
+    return cached.rows;
+  }
+  const store = new TetherStateStore();
+  let rows: SessionSummary[] = [];
+  try {
+    rows = store.list(cwd ? { cwd } : {}).map(threadSummary);
+  } catch {
+    rows = [];
+  } finally {
+    store.close();
+  }
+  // 索引为空（首次启动/全新目录）时才有必要同步等一次，否则先给缓存、后台再校准
+  if (rows.length === 0 && sessionsLastRefreshAt === 0) {
+    try {
+      const threads = await listTetherThreads(cwd ? { cwd } : {});
+      rows = threads.map(threadSummary);
+      sessionsLastRefreshAt = Date.now();
+    } catch {
+      /* 索引失败时返回空列表，不阻塞启动 */
+    }
+  }
+  sessionsListCache = { key, at: Date.now(), rows };
+  return rows;
+}
+
+function scheduleSessionsRefresh(): void {
+  if (sessionsRefreshTimer || sessionsRefreshTask) return;
+  const since = Date.now() - sessionsLastRefreshAt;
+  const delay = Math.max(SESSIONS_REFRESH_DEBOUNCE_MS, SESSIONS_REFRESH_MIN_INTERVAL_MS - since);
+  sessionsRefreshTimer = setTimeout(() => {
+    sessionsRefreshTimer = undefined;
+    void refreshSessionIndex();
+  }, delay);
+}
+
+async function refreshSessionIndex(): Promise<void> {
+  if (sessionsRefreshTask) return sessionsRefreshTask;
+  const task = (async () => {
+    try {
+      const startedAt = Date.now();
+      const rows = (await listTetherThreads({})).map(threadSummary);
+      const elapsed = Date.now() - startedAt;
+      if (elapsed > 500) logPerf(`sessions:refresh ${elapsed}ms rows=${rows.length}`);
+      sessionsLastRefreshAt = Date.now();
+      sessionsListCache = { key: "", at: Date.now(), rows };
+      mainWindow?.webContents.send("sessions:changed", rows);
+    } catch {
+      /* 索引失败不影响 UI */
+    }
+  })().finally(() => {
+    if (sessionsRefreshTask === task) sessionsRefreshTask = undefined;
+  });
+  sessionsRefreshTask = task;
+  return task;
 }
 
 function registerIpc(): void {
@@ -668,7 +865,7 @@ function registerIpc(): void {
       );
     if (!allowed) return [];
     watchWorkspace(root);
-    return listWorkspaceFiles(root);
+    return listWorkspaceFilesCached(root);
   });
   ipcMain.handle("vision:config", async () => {
     let raw: unknown = {};
@@ -787,24 +984,10 @@ function registerIpc(): void {
   });
 
   ipcMain.handle("sessions:list", async (_event, cwd?: string) => {
-    const threads = await listTetherThreads(cwd ? { cwd } : {});
-    return threads.map(
-      (thread): SessionSummary => ({
-        path: thread.sessionPath,
-        storagePath: thread.storagePath,
-        id: thread.id,
-        cwd: thread.cwd,
-        title: visionTitle(thread.title),
-        createdAt: thread.createdAt,
-        updatedAt: thread.updatedAt,
-        ...(thread.provider ? { provider: thread.provider } : {}),
-        ...(thread.model ? { model: thread.model } : {}),
-        messageCount: thread.messageCount,
-        ...(thread.preview ? { preview: thread.preview } : {}),
-        pinned: thread.pinned,
-        archived: thread.archived,
-      }),
-    );
+    const rows = await listSessionSummaries(cwd);
+    // 索引（解析 jsonl）放后台并去抖：列表接口不再等它，避免大会话把主进程钉住
+    scheduleSessionsRefresh();
+    return rows;
   });
   ipcMain.handle("sessions:remove", async (_event, id: string) => {
     const store = new TetherStateStore();
@@ -813,6 +996,7 @@ function registerIpc(): void {
       await store.archive(id);
     } finally {
       store.close();
+      sessionsListCache = undefined;
     }
   });
   ipcMain.handle(
@@ -825,6 +1009,7 @@ function registerIpc(): void {
           throw new Error("Conversation not found");
       } finally {
         store.close();
+        sessionsListCache = undefined;
       }
     },
   );
@@ -849,6 +1034,7 @@ function registerIpc(): void {
         await store.indexSession(thread.storagePath);
       } finally {
         store.close();
+        sessionsListCache = undefined;
       }
     },
   );
@@ -1030,6 +1216,32 @@ function registerIpc(): void {
   ipcMain.handle("agent:running-sessions", () => {
     return hostManager!.getRunningSessions();
   });
+}
+
+const HOST_IDLE_REAP_INTERVAL_MS = 60_000;
+const SESSIONS_PERIODIC_REFRESH_TICKS = 5;
+let maintenanceTimer: ReturnType<typeof setInterval> | undefined;
+let maintenanceTicks = 0;
+
+/**
+ * 主进程维护定时器：
+ * - 空闲会话 runtime 回收（原逻辑只在“新建 host 前”顺带执行，闲置进程因此能活好几天）；
+ * - 会话索引低频校准（让外部写入的会话也能被发现）。
+ */
+function startMaintenanceTimers(): void {
+  clearInterval(maintenanceTimer);
+  maintenanceTicks = 0;
+  maintenanceTimer = setInterval(() => {
+    maintenanceTicks += 1;
+    try {
+      hostManager?.pruneIdleHosts();
+    } catch {
+      /* 回收失败不影响主流程 */
+    }
+    if (maintenanceTicks % SESSIONS_PERIODIC_REFRESH_TICKS === 0) {
+      scheduleSessionsRefresh();
+    }
+  }, HOST_IDLE_REAP_INTERVAL_MS);
 }
 
 async function readHomeJson(name: string): Promise<unknown> {
@@ -1409,149 +1621,176 @@ function isWorkspaceItem(value: unknown): value is WorkspaceItem {
   );
 }
 
-const SKIP_DIRS = new Set([
-  ".git",
-  "node_modules",
-  "dist",
-  "dist-dev",
-  "dist-production",
-  "build",
-  "out",
-  "coverage",
-  ".next",
-  ".nuxt",
-  ".output",
-  ".turbo",
-  ".vite",
-  ".cache",
-  ".tether",
-  ".build",
-  "DerivedData",
-  "Pods",
-  "__pycache__",
-  ".pnpm-store",
-]);
+const WORKSPACE_WATCH_DEBOUNCE_MS = 250;
+const WORKSPACE_BURST_WINDOW_MS = 2_000;
+// 一个窗口期内超过这个事件量就认定为构建/批量写盘风暴，改为“安静后整体刷新一次”。
+const WORKSPACE_BURST_EVENT_LIMIT = 600;
+const WORKSPACE_BURST_QUIET_MS = 3_000;
+const WORKSPACE_CHANGE_PATH_LIMIT = 500;
+const WORKSPACE_WATCH_RETRY_MS = 5_000;
 
-// ponytail: one recursive fs.watch, 200ms debounce. Ceiling: skip SKIP_DIRS/dotdirs; upgrade to chokidar if events drop on Linux/network FS.
+/**
+ * 工作区根的 .tetherignore：一行一个模式，`#` 开头为注释。
+ * `name` 匹配任意层级的同名文件/目录，`a/b` 匹配相对路径前缀。
+ */
+async function loadWorkspaceIgnore(root: string): Promise<string[]> {
+  try {
+    const raw = await fsp.readFile(path.join(root, ".tetherignore"), "utf8");
+    return parseWorkspaceIgnore(raw);
+  } catch {
+    return [];
+  }
+}
+
+// FSEvents 风暴保护：正常编辑走防抖逐条路径通知，构建期风暴则静默并在安静后整体刷新。
+let watchIgnorePatterns: string[] = [];
+let watchBurstMode = false;
+let watchEventCount = 0;
+let watchWindowStart = 0;
+let watchPathsTruncated = false;
+let watchQuietTimer: ReturnType<typeof setTimeout> | undefined;
+let watchRetryTimer: ReturnType<typeof setTimeout> | undefined;
+let watchPendingPaths = new Set<string>();
+
+function sendWorkspaceChange(root: string, paths: string[], truncated: boolean): void {
+  // 变更后让下一次 list 真正重扫（否则 TTL 缓存会返回过期文件树）
+  workspaceListCache = undefined;
+  mainWindow?.webContents.send("workspace:changed", { root, paths, truncated });
+}
+
+function skipWatch(filename: string | null): boolean {
+  return isIgnoredWatchPath(filename, watchIgnorePatterns);
+}
+
 function watchWorkspace(root: string): void {
-  if (watchedWorkspace === root) return;
+  if (watchedWorkspace === root && workspaceWatcher) return;
   workspaceWatcher?.close();
   workspaceWatcher = undefined;
   watchedWorkspace = root;
+  watchIgnorePatterns = [];
+  watchBurstMode = false;
+  watchEventCount = 0;
+  watchWindowStart = 0;
+  watchPathsTruncated = false;
+  watchPendingPaths = new Set<string>();
+  void loadWorkspaceIgnore(root).then((patterns) => {
+    if (watchedWorkspace === root) watchIgnorePatterns = patterns;
+  });
   try {
     workspaceWatcher = fs.watch(
       root,
       { persistent: false, recursive: true },
       (_event, filename) => {
         if (skipWatch(filename)) return;
+        const relative = filename!.replaceAll("\\", "/");
+        const now = Date.now();
+        if (now - watchWindowStart > WORKSPACE_BURST_WINDOW_MS) {
+          watchWindowStart = now;
+          watchEventCount = 0;
+        }
+        watchEventCount += 1;
+        if (watchEventCount > WORKSPACE_BURST_EVENT_LIMIT) {
+          // 事件风暴：清空待发路径，安静下来后只通知一次“整体刷新”
+          watchBurstMode = true;
+          watchPendingPaths.clear();
+          clearTimeout(watchTimer);
+          clearTimeout(watchQuietTimer);
+          watchQuietTimer = setTimeout(() => {
+            watchBurstMode = false;
+            watchEventCount = 0;
+            watchPathsTruncated = false;
+            sendWorkspaceChange(root, [], true);
+          }, WORKSPACE_BURST_QUIET_MS);
+          return;
+        }
+        if (watchBurstMode) return;
+        if (watchPendingPaths.size < WORKSPACE_CHANGE_PATH_LIMIT) {
+          watchPendingPaths.add(relative);
+        } else {
+          watchPathsTruncated = true;
+        }
         clearTimeout(watchTimer);
         watchTimer = setTimeout(() => {
-          mainWindow?.webContents.send("workspace:changed", root);
-        }, 200);
+          const paths = [...watchPendingPaths];
+          const truncated = watchPathsTruncated;
+          watchPendingPaths.clear();
+          watchPathsTruncated = false;
+          sendWorkspaceChange(root, paths, truncated);
+        }, WORKSPACE_WATCH_DEBOUNCE_MS);
       },
     );
     workspaceWatcher.on("error", () => {
       workspaceWatcher?.close();
       workspaceWatcher = undefined;
-      watchedWorkspace = "";
+      // 监听器自身出错不该让文件面板永久失联：稍后重建一次
+      clearTimeout(watchRetryTimer);
+      watchRetryTimer = setTimeout(() => {
+        if (watchedWorkspace !== root) return;
+        watchedWorkspace = "";
+        watchWorkspace(root);
+      }, WORKSPACE_WATCH_RETRY_MS);
     });
   } catch {
     watchedWorkspace = "";
   }
 }
 
-function skipWatch(filename: string | null): boolean {
-  if (!filename) return false;
-  return filename
-    .replaceAll("\\", "/")
-    .split("/")
-    .some(
-      (part) =>
-        SKIP_DIRS.has(part) || (part.startsWith(".") && part !== ".agents"),
+const WORKSPACE_LIST_TTL_MS = 3_000;
+const PERF_LOG_LIMIT_BYTES = 10 * 1024 * 1024;
+let workspaceListCache: { root: string; at: number; value: string[] } | undefined;
+const workspaceListInflight = new Map<string, Promise<string[]>>();
+
+/** 轻量可观测性：只记录真正慢的操作，落在 <Tether home>/perf.log，超过 10MB 轮转一份。 */
+function logPerf(message: string): void {
+  try {
+    const file = path.join(getTetherHome(), "perf.log");
+    const stat = fs.statSync(file, { throwIfNoEntry: false });
+    if (stat && stat.size > PERF_LOG_LIMIT_BYTES) {
+      fs.renameSync(file, `${file}.1`);
+    }
+  } catch {
+    /* 日志失败不影响主流程 */
+  }
+  try {
+    fs.appendFile(
+      path.join(getTetherHome(), "perf.log"),
+      `${new Date().toISOString()} ${message}\n`,
+      () => undefined,
     );
+  } catch {
+    /* 同上 */
+  }
 }
 
-// ponytail: dirs always complete; files capped globally + per folder so DFS doesn't starve later siblings.
-async function listWorkspaceFiles(
-  root: string,
-  fileLimit = 8000,
-  perDirLimit = 200,
-): Promise<string[]> {
-  const dirs: string[] = [];
-  const files: string[] = [];
-  async function walk(dir: string): Promise<void> {
-    let entries;
-    try {
-      entries = await fsp.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    entries.sort(
-      (left, right) =>
-        Number(right.isDirectory()) - Number(left.isDirectory()) ||
-        left.name.localeCompare(right.name),
-    );
-    let localFiles = 0;
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (SKIP_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
-        dirs.push(
-          `${path.relative(root, path.join(dir, entry.name)).replaceAll("\\", "/")}/`,
-        );
-        await walk(path.join(dir, entry.name));
-        continue;
-      }
-      if (files.length >= fileLimit || localFiles >= perDirLimit) continue;
-      if (!entry.isFile() || entry.name.startsWith(".")) continue;
-      files.push(
-        path.relative(root, path.join(dir, entry.name)).replaceAll("\\", "/"),
-      );
-      localFiles += 1;
-    }
+/** 目录里带 CACHEDIR.TAG 就是标准缓存目录（rust target 等），一律跳过。 */
+/**
+ * 文件树列表：TTL 缓存 + 单飞，避免 watcher 事件让多个订阅者同时全量重扫。
+ */
+async function listWorkspaceFilesCached(root: string): Promise<string[]> {
+  const cached = workspaceListCache;
+  if (cached && cached.root === root && Date.now() - cached.at < WORKSPACE_LIST_TTL_MS) {
+    return cached.value;
   }
-  await walk(root);
-  await addSkillManifests(root, files);
-  return dirs.concat(files);
-}
-
-const SKILL_ROOTS = PROJECT_SKILL_ROOTS;
-
-async function addSkillManifests(root: string, files: string[]): Promise<void> {
-  const seen = new Set(files);
-  for (const rel of SKILL_ROOTS) {
-    let entries;
-    try {
-      entries = await fsp.readdir(path.join(root, rel), {
-        withFileTypes: true,
-      });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const skill = `${rel}/${entry.name}/SKILL.md`;
-      try {
-        await fsp.stat(path.join(root, skill));
-      } catch {
-        continue;
-      }
-      if (!seen.has(skill)) {
-        files.push(skill);
-        seen.add(skill);
-      }
-    }
-  }
-  for (const extra of [".agents/features.json", ".agents/progress.md"]) {
-    try {
-      await fsp.stat(path.join(root, extra));
-    } catch {
-      continue;
-    }
-    if (!seen.has(extra)) {
-      files.push(extra);
-      seen.add(extra);
-    }
-  }
+  const inflight = workspaceListInflight.get(root);
+  if (inflight) return inflight;
+  const task = (async () => {
+    const startedAt = Date.now();
+    const ignore = await loadWorkspaceIgnore(root);
+    const value = await listWorkspaceFiles({
+      root,
+      ignorePatterns: ignore,
+      skillRoots: PROJECT_SKILL_ROOTS,
+      skillExtras: [".agents/features.json", ".agents/progress.md"],
+    });
+    workspaceListCache = { root, at: Date.now(), value };
+    const elapsed = Date.now() - startedAt;
+    if (elapsed > 300) logPerf(`workspace:list ${elapsed}ms entries=${value.length} root=${root}`);
+    return value;
+  })().finally(() => {
+    workspaceListInflight.delete(root);
+  });
+  workspaceListInflight.set(root, task);
+  return task;
 }
 
 app.whenReady().then(async () => {
@@ -1562,6 +1801,7 @@ app.whenReady().then(async () => {
   registerIpc();
   installMenu();
   if (process.platform === "darwin") applyDockIcon();
+  startMaintenanceTimers();
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -1579,6 +1819,12 @@ app.on("before-quit", (event) => {
   // are detached; skipping this leaves orphan `sh -lc` / find / rg processes.
   event.preventDefault();
   quitting = true;
+  clearInterval(maintenanceTimer);
+  maintenanceTimer = undefined;
+  clearTimeout(watchTimer);
+  clearTimeout(watchQuietTimer);
+  clearTimeout(watchRetryTimer);
+  clearTimeout(rendererUnresponsiveTimer);
   workspaceWatcher?.close();
   void Promise.resolve(hostManager?.stopAll())
     .catch(() => undefined)

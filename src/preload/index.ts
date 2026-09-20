@@ -3,7 +3,9 @@ import type { Locale } from "../shared/i18n";
 import type {
   AgentEvent,
   DesktopApi,
+  SessionSummary,
   UpdateProgress,
+  WorkspaceChange,
 } from "../shared/types";
 
 function subscribe<T>(channel: string, listener: (payload: T) => void): () => void {
@@ -46,7 +48,7 @@ const api: DesktopApi = {
     reveal: (filePath, cwd) => ipcRenderer.invoke("workspace:reveal", filePath, cwd),
     list: (cwd) => ipcRenderer.invoke("workspace:list", cwd),
     restore: (files, cwd) => ipcRenderer.invoke("workspace:restore", files, cwd),
-    onChanged: (listener) => subscribe<string>("workspace:changed", listener),
+    onChanged: (listener) => subscribe<WorkspaceChange>("workspace:changed", listener),
   },
   vision: {
     config: () => ipcRenderer.invoke("vision:config"),
@@ -66,6 +68,7 @@ const api: DesktopApi = {
     remove: (id) => ipcRenderer.invoke("sessions:remove", id),
     pin: (id, pinned) => ipcRenderer.invoke("sessions:pin", id, pinned),
     rename: (id, title) => ipcRenderer.invoke("sessions:rename", id, title),
+    onChanged: (listener) => subscribe<SessionSummary[]>("sessions:changed", listener),
   },
   auth: {
     status: () => ipcRenderer.invoke("auth:status"),

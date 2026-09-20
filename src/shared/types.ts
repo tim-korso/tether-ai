@@ -198,6 +198,16 @@ export type UpdateInstallResult =
   | { ok: true; action: "restarting" | "opened-installer" }
   | { ok: false; cancelled?: boolean; error?: string };
 
+/**
+ * 工作区变更推送。paths 是本次变更的相对路径集合；truncated 为 true 表示事件量过大已被抑制，
+ * 渲染层应做一次整体刷新而不是按路径增量刷新。
+ */
+export interface WorkspaceChange {
+  root: string;
+  paths: string[];
+  truncated: boolean;
+}
+
 export interface DesktopApi {
   platform: NodeJS.Platform;
   app: {
@@ -234,7 +244,7 @@ export interface DesktopApi {
     reveal(path: string, cwd?: string): Promise<void>;
     list(cwd?: string): Promise<string[]>;
     restore(files: Array<{ path: string; content: string | null; mode?: number }>, cwd?: string): Promise<{ restored: string[] }>;
-    onChanged(listener: (root: string) => void): () => void;
+    onChanged(listener: (change: WorkspaceChange) => void): () => void;
   };
   vision: {
     config(): Promise<{
@@ -265,6 +275,7 @@ export interface DesktopApi {
     remove(id: string): Promise<void>;
     pin(id: string, pinned: boolean): Promise<void>;
     rename(id: string, title: string): Promise<void>;
+    onChanged(listener: (sessions: SessionSummary[]) => void): () => void;
   };
   auth: {
     status(): Promise<ProviderStatus[]>;

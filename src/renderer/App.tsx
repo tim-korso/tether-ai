@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type {
+  AgentEvent,
   AgentSessionStats,
   AgentSnapshot,
   ExtensionUiRequest,
@@ -385,6 +386,25 @@ interface SessionCacheItem {
   draft?: string;
 }
 
+const SESSION_STATE_CACHE_MAX = 12;
+
+/**
+ * 会话状态缓存原来只增不减：逛过的每个会话都把完整消息数组留在堆里，长时间运行后渲染进程能涨到 1G+。
+ * 这里按“最近使用”只保留少量会话，被淘汰的会话切回去时按需重新加载。
+ */
+function trimSessionStateCache(
+  cache: Map<string, SessionCacheItem>,
+  keep: Array<string | undefined>,
+): void {
+  if (cache.size <= SESSION_STATE_CACHE_MAX) return;
+  const pinned = new Set(keep.filter((value): value is string => Boolean(value)));
+  for (const key of [...cache.keys()]) {
+    if (cache.size <= SESSION_STATE_CACHE_MAX) return;
+    if (pinned.has(key)) continue;
+    cache.delete(key);
+  }
+}
+
 export function App() {
   const { t, locale } = useI18n();
   const [workspaces, setWorkspaces] = useState<WorkspaceItem[]>([]);
@@ -482,6 +502,7 @@ export function App() {
     if (cached) {
       sessionStates.current.delete(tempId);
       sessionStates.current.set(realPath, cached);
+      trimSessionStateCache(sessionStates.current, [realPath, sessionRef.current]);
     }
     if (sessionRef.current === tempId) sessionRef.current = realPath;
     setActiveSession((current) => (current === tempId ? realPath : current));
@@ -504,6 +525,7 @@ export function App() {
       queueHeld: existing?.queueHeld ?? queueHeld.current,
       draft: draftRef.current,
     });
+    trimSessionStateCache(sessionStates.current, [key, sessionRef.current, activeSession]);
   }, [activeSession, agentSkills, messages, queued, running, stats, uiRequest]);
   const sending = useRef(false);
   const queuedRef = useRef(queued);
@@ -513,6 +535,33 @@ export function App() {
   const stick = useRef(true);
   const dock = useRef<HTMLDivElement>(null);
   const live = useRef(false);
+
+  // 高频流式事件（message_update / tool_execution_update）按帧合并后再进 React：
+  // 这两类事件都是“整条消息/整段输出的重复覆盖”，逐条 setMessages 会让分组、锚点、工具列表
+  // 等 O(n) 派生量每帧重算多次，是流式期间主线程 100% 的主要来源。
+  const pendingStreamEvents = useRef<Array<{ session?: string; event: AgentEvent }>>([]);
+  const streamFlushFrame = useRef<number | null>(null);
+  const flushStreamEvents = useCallback(() => {
+    streamFlushFrame.current = null;
+    const batch = pendingStreamEvents.current;
+    if (batch.length === 0) return;
+    pendingStreamEvents.current = [];
+    if (!live.current) return;
+    const current = sessionRef.current;
+    // 会话已切换/临时 id 已落地的事件直接丢弃：下一次 message_update 会带上完整内容
+    const usable = current
+      ? batch.filter((item) => !item.session || isSamePath(item.session, current))
+      : batch;
+    if (usable.length === 0) return;
+    setMessages((messages) =>
+      usable.reduce((acc, item) => applyAgentEvent(acc, item.event), messages),
+    );
+  }, []);
+  const enqueueStreamEvent = useCallback((event: AgentEvent) => {
+    pendingStreamEvents.current.push({ session: sessionRef.current, event });
+    if (streamFlushFrame.current !== null) return;
+    streamFlushFrame.current = requestAnimationFrame(() => flushStreamEvents());
+  }, [flushStreamEvents]);
   const pendingUndo = useRef<{ files: RestoreFile[] } | undefined>(
     undefined,
   );
@@ -769,6 +818,7 @@ export function App() {
             agentSkills: snapshot.skills ?? [],
             cwd: snapshot.cwd ?? cwd,
           });
+          trimSessionStateCache(sessionStates.current, [resolvedTarget, sessionRef.current, activeSession]);
           setRunningSessions((prev) => new Set(prev).add(resolvedTarget));
         } else {
           const raw = normalizeMessages(snapshot.messages);
@@ -798,6 +848,7 @@ export function App() {
             agentSkills: snapshot.skills ?? [],
             cwd: snapshot.cwd ?? cwd,
           });
+          trimSessionStateCache(sessionStates.current, [resolvedTarget, sessionRef.current, activeSession]);
         }
       }
 
@@ -1478,6 +1529,11 @@ export function App() {
     void window.harness.agent.runningSessions?.().then((sessions) => {
       if (sessions?.length) setRunningSessions(new Set(sessions));
     }).catch(() => undefined);
+    // 主进程后台刷新会话索引后会推一份新列表，避免渲染层反复自己拉全量
+    const offSessions = window.harness.sessions.onChanged?.((next) => {
+      if (Array.isArray(next)) updateSessions(next);
+    });
+    return () => offSessions?.();
   }, []);
 
   useEffect(() => {
@@ -1633,7 +1689,14 @@ export function App() {
           if (request.method === "notify") setToast(request.message ?? t("toast.notify"));
           else if (["select", "confirm", "input", "editor"].includes(request.method)) setUiRequest(request);
         }
-        setMessages((current) => (live.current ? applyAgentEvent(current, event) : current));
+        if (event.type === "message_update" || event.type === "tool_execution_update") {
+          // 可安全按帧合并：两类事件都携带完整当前状态，丢掉中间帧不影响最终内容
+          enqueueStreamEvent(event);
+        } else {
+          // 结构性事件严格保序：先把已排队的增量落地，再应用本条
+          flushStreamEvents();
+          setMessages((current) => (live.current ? applyAgentEvent(current, event) : current));
+        }
       } else {
         if (event.type === "agent_settled") {
           void window.harness.sessions.list().then(updateSessions);

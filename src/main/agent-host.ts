@@ -26,6 +26,36 @@ const LONG_RUNNING_REQUESTS = new Set([
   "compact",
 ]);
 
+/**
+ * 渲染层只消费消息/工具/状态类事件：`custom` 事件（如 tether-checkpoint 携带整文件 before/after
+ * 快照）在 UI 中不落地——聊天视图对 `custom` 直接 bail out，撤销所需正文是 /undo 时通过
+ * get_entries 现取的。这类 payload 单条可达 270KB，原样过 IPC 每个补丁都要多付一次序列化与拷贝，
+ * 所以超过阈值时只保留可枚举的元数据。
+ */
+const CUSTOM_EVENT_PAYLOAD_LIMIT = 64 * 1024;
+
+function slimAgentEvent(event: AgentEvent): AgentEvent {
+  if (event.type !== "custom") return event;
+  const data = (event as { data?: unknown }).data;
+  if (data === undefined) return event;
+  let size = 0;
+  try {
+    size = JSON.stringify(data).length;
+  } catch {
+    return event;
+  }
+  if (size <= CUSTOM_EVENT_PAYLOAD_LIMIT) return event;
+  const raw = data as { id?: unknown };
+  return {
+    ...event,
+    data: {
+      ...(typeof raw.id === "string" ? { id: raw.id } : {}),
+      truncated: true,
+      originalChars: size,
+    },
+  };
+}
+
 export class AgentHost {
   private child?: ChildProcessWithoutNullStreams;
   private lineBuffer = Buffer.alloc(0);
@@ -336,7 +366,7 @@ export class AgentHost {
         ...(this.sessionPath ? { sessionPath: this.sessionPath } : {}),
         ...(this.tempId ? { tempId: this.tempId } : {}),
       };
-      this.emitEvent(event);
+      this.emitEvent(slimAgentEvent(event));
     }
   }
 
