@@ -153,6 +153,7 @@ const zh = {
   "toast.errorStreamInterrupted": "模型流中断了（常见于停止委派后立刻继续）。点「继续」再试一次，或换个更稳的模型。",
   "toast.stopping": "正在停止…",
   "toast.steered": "已排队",
+  "toast.steeredNow": "已插话发送",
   "toast.steerLimit": "最多 {n} 条排队",
   "composer.retryContinue": "请从中断处继续，不要重复已完成的步骤。",
   "toast.errorEndpoint":
@@ -169,6 +170,8 @@ const zh = {
   "composer.steering": "{n} 条排队",
   "composer.queueEdit": "改回输入框",
   "composer.queueRemove": "从排队移除",
+  "composer.queueSendNow": "立即插话发送",
+  "composer.queuePaused": "队列已暂停（上一次中断或出错后）——点「立即插话发送」继续，或直接发一条新消息。",
   "composer.selectProject": "选择项目",
   "composer.selectOrOpen": "选择或打开本地项目",
   "composer.uploadImage": "上传图片",
@@ -643,6 +646,7 @@ const en: Record<MessageKey, string> = {
     "The model stream broke (common after stopping a delegate). Click Continue, or switch to a more stable model.",
   "toast.stopping": "Stopping…",
   "toast.steered": "Queued",
+  "toast.steeredNow": "Sent into the current turn",
   "toast.steerLimit": "At most {n} queued messages",
   "composer.retryContinue": "Continue from where we left off. Do not redo completed steps.",
   "toast.errorEndpoint":
@@ -663,6 +667,8 @@ const en: Record<MessageKey, string> = {
   "composer.steering": "{n} queued",
   "composer.queueEdit": "Edit in composer",
   "composer.queueRemove": "Remove from queue",
+  "composer.queueSendNow": "Send into the current turn",
+  "composer.queuePaused": "Queue is paused after the last stop or error — press Send into the current turn to resume, or just send a new message.",
   "composer.selectProject": "Choose project",
   "composer.selectOrOpen": "Choose or open a local project",
   "composer.uploadImage": "Upload image",

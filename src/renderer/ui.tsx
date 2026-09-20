@@ -2077,6 +2077,7 @@ export function PromptBar({
   onSubmit,
   onStop,
   steering,
+  queueHeld,
   rootRef,
   running,
   disabled,
@@ -2095,6 +2096,7 @@ export function PromptBar({
   onCompact,
   onQueuedEdit,
   onQueuedRemove,
+  onQueuedSendNow,
   onChange,
   skillCommands = [],
   placement = "dock",
@@ -2123,6 +2125,10 @@ export function PromptBar({
   onCompact?(): void;
   onQueuedEdit?(index: number): void;
   onQueuedRemove?(index: number): void;
+  /** 队列被上一次中断/错误暂停：UI 需要给出继续入口。 */
+  queueHeld?: boolean;
+  /** 立即插话发送：交给 runtime 的 steer 通道直接送进当前这一轮。 */
+  onQueuedSendNow?(index: number): void;
   onChange?(text: string): void;
   skillCommands?: AgentSkillCommand[];
   placement?: "dock" | "hero";
@@ -2522,11 +2528,19 @@ export function PromptBar({
           </div>
           {steerOpen && steerItems.length > 0 && (
             <div className="prompt-queue">
+              {queueHeld && (
+                <p className="prompt-queue-hint">{t("composer.queuePaused")}</p>
+              )}
               {steerItems.map((item, index) => (
                 <div key={`${index}-${item}`} className="prompt-queue-row">
                   <span className="prompt-queue-index">{index + 1}</span>
                   <p className="prompt-queue-text">{item}</p>
                   <div className="prompt-queue-actions">
+                    {onQueuedSendNow && (
+                      <button type="button" className="bubble-action" aria-label={t("composer.queueSendNow")} title={t("composer.queueSendNow")} onClick={() => onQueuedSendNow(index)}>
+                        <Icon path="M9 10L4 15l5 5M4 15h9a7 7 0 0 0 0-14h-3" size={12} />
+                      </button>
+                    )}
                     {onQueuedEdit && (
                       <button type="button" className="bubble-action" aria-label={t("composer.queueEdit")} onClick={() => onQueuedEdit(index)}>
                         <Icon path="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z" size={12} />

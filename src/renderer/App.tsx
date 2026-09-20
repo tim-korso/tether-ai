@@ -13,6 +13,16 @@ import type {
 import type { AgentSkillCommand } from "../shared/skills";
 import { parseSkillCommands, skillSlashCommand } from "../shared/skills";
 import {
+  pathSetHas,
+  promoteQueuedPrompt,
+  queuedPromptFrom,
+  removeQueuedPrompt,
+  restoreQueuedPrompt,
+  samePathSet,
+  shouldDispatchQueuedMessage,
+  type QueuedPrompt,
+} from "./message-queue";
+import {
   DEFAULT_EFFORT,
   levelsForModel,
   normalizeEffort,
@@ -378,7 +388,7 @@ interface SessionCacheItem {
   messages: ChatMessage[];
   running: boolean;
   stats?: AgentSessionStats;
-  queued: Array<{ text: string; images?: string[] }>;
+  queued: QueuedPrompt[];
   uiRequest?: ExtensionUiRequest;
   agentSkills?: AgentSkillCommand[];
   cwd?: string;
@@ -449,7 +459,8 @@ export function App() {
   const fillPrompt = useCallback((text: string) => {
     setPromptFill((current) => ({ text, token: current.token + 1 }));
   }, []);
-  const [queued, setQueued] = useState<Array<{ text: string; images?: string[] }>>([]);
+  const [queued, setQueued] = useState<QueuedPrompt[]>([]);
+  const [queuePaused, setQueuePaused] = useState(false);
   const [running, setRunning] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loginOpen, setLoginOpen] = useState(false);
@@ -532,6 +543,13 @@ export function App() {
   queuedRef.current = queued;
   const queueFlush = useRef(false);
   const queueHeld = useRef(false);
+  const runningSessionsRef = useRef<Set<string>>(new Set());
+  runningSessionsRef.current = runningSessions;
+  // 主进程连续两次报告空闲才认为 run 真的结束（避开起跑窗口的误判）
+  const idleProbes = useRef(0);
+  // 队列派发器：单一幂等入口，sendMessage 与各个事件触发点都通过这个 ref 调用，
+  // 避免「ref 守卫 + 无状态触发」造成的黑洞（排了队却再也没人叫醒派发）。
+  const dispatchQueueRef = useRef<() => void>(() => undefined);
   const stick = useRef(true);
   const dock = useRef<HTMLDivElement>(null);
   const live = useRef(false);
@@ -965,7 +983,7 @@ export function App() {
     const targetDraft = cached?.draft ?? "";
     draftRef.current = targetDraft;
     fillPrompt(targetDraft);
-    queueHeld.current = Boolean(cached?.queueHeld);
+    setQueueHeld(Boolean(cached?.queueHeld), session.path);
     if (cached) {
       setMessages(cached.messages);
       setRunning(isRunning);
@@ -989,10 +1007,13 @@ export function App() {
 
     if (isRunning) {
       void window.harness.agent.command("get_state", undefined, session.path).catch(() => undefined);
+      // 切回一个仍在跑的会话：叫一次派发器（若有可发的队首且已空闲，这里就能发出）
+      dispatchQueueRef.current();
       return;
     }
 
     void startAgent(session.cwd, session.path, true, true, permission, undefined, session.storagePath);
+    dispatchQueueRef.current();
   }, [activeSession, fillPrompt, isSessionInSet, loading, messages.length, permission, runningSessions, saveCurrentSessionToCache, startAgent]);
 
   const ensureModelReady = useCallback(async (): Promise<boolean> => {
@@ -1027,7 +1048,7 @@ export function App() {
 
   const bindProject = useCallback(async (cwd: string): Promise<boolean> => {
     saveCurrentSessionToCache();
-    queueHeld.current = false;
+    setQueueHeld(false);
     draftRef.current = "";
     stick.current = true;
     live.current = false;
@@ -1057,7 +1078,7 @@ export function App() {
 
   const newThread = useCallback(async () => {
     saveCurrentSessionToCache();
-    queueHeld.current = false;
+    setQueueHeld(false);
     draftRef.current = "";
     stick.current = true;
     live.current = false;
@@ -1274,24 +1295,58 @@ export function App() {
     }
   }, [loading, running]);
 
-  const sendMessage = useCallback(async (preset?: string, images?: string[]) => {
+  /** 队列暂停开关：同时写入当前会话缓存，避免切会话后被遗忘或永久粘住。 */
+  const setQueueHeld = useCallback(
+    (held: boolean, sessionKey?: string) => {
+      queueHeld.current = held;
+      const key = sessionKey ?? sessionRef.current ?? activeSession;
+      if (key) {
+        const cached = sessionStates.current.get(key);
+        if (cached) cached.queueHeld = held;
+      }
+      setQueuePaused(held);
+    },
+    [activeSession],
+  );
+
+  /** 从队列派发失败：退回队首并暂缓自动派发，避免热循环。 */
+  const restoreQueueHeadOnFailure = useCallback(
+    (prompt?: QueuedPrompt) => {
+      if (!prompt) return;
+      const key = sessionRef.current || activeSession;
+      if (key) {
+        const cached = sessionStates.current.get(key);
+        if (cached) {
+          cached.queued = [
+            prompt,
+            ...(cached.queued ?? []).filter((item) => item.id !== prompt.id),
+          ];
+        }
+      }
+      setQueued((current) => restoreQueuedPrompt(current, prompt));
+      setQueueHeld(true, key);
+    },
+    [activeSession, setQueueHeld],
+  );
+
+  const sendMessage = useCallback(async (preset?: string, images?: string[], options?: { fromQueue?: boolean }): Promise<boolean> => {
     const text = (preset ?? "").trim();
     if (text === "/undo") {
-      if (running) return;
+      if (running) return false;
       fillPrompt("");
       void undoLastTurn();
-      return;
+      return false;
     }
     if (running) {
-      if ((!text && !images?.length) || text.startsWith("/")) return;
+      if ((!text && !images?.length) || text.startsWith("/")) return false;
       if (queued.length >= MAX_STEER_ROWS) {
         setToast(t("toast.steerLimit", { n: MAX_STEER_ROWS }));
-        return;
+        return false;
       }
       const followup = text || t("toast.defaultImagePrompt");
       fillPrompt("");
       setQueued((current) => {
-        const next = [...current, { text: followup, images }];
+        const next: QueuedPrompt[] = [...current, queuedPromptFrom(followup, images)];
         const target = sessionRef.current || activeSession;
         if (target) {
           const cached = sessionStates.current.get(target);
@@ -1300,16 +1355,16 @@ export function App() {
         return next;
       });
       setToast(t("toast.steered"));
-      return;
+      return false;
     }
     let question = text;
     let attached = images;
     if (!question && !attached?.length) {
       const next = queuedRef.current[0];
-      if (!next || loading || sending.current) return;
-      queueHeld.current = false;
+      if (!next || loading || sending.current) return false;
+      setQueueHeld(false);
       setQueued((current) => {
-        const nextQ = current.slice(1);
+        const nextQ = current.filter((item) => item.id !== next.id);
         const target = sessionRef.current || activeSession;
         if (target) {
           const cached = sessionStates.current.get(target);
@@ -1320,9 +1375,9 @@ export function App() {
       question = next.text;
       attached = next.images;
     }
-    if ((!question && !attached?.length) || loading || sending.current) return;
+    if ((!question && !attached?.length) || loading || sending.current) return false;
     sending.current = true;
-    queueHeld.current = false;
+    setQueueHeld(false);
     draftRef.current = "";
     const activeKey = sessionRef.current || activeSession;
     if (activeKey) {
@@ -1342,11 +1397,12 @@ export function App() {
     });
     let optimistic: ChatMessage | undefined;
     let optimisticSessionId: string | undefined;
+    let accepted = false;
     try {
       let cwd = workspace ?? agentCwd.current;
       if (!cwd) {
         const opened = await openFolder();
-        if (!opened) return;
+        if (!opened) return false;
         cwd = opened;
       }
 
@@ -1411,7 +1467,7 @@ export function App() {
             }
             updateSessions();
           }
-          return;
+          return false;
         }
       } else if (!(await ensureModelReady())) {
         setMessages((current) => current.filter((item) => item.id !== optimistic!.id));
@@ -1430,7 +1486,7 @@ export function App() {
           }
           updateSessions();
         }
-        return;
+        return false;
       }
 
       const targetSession = sessionRef.current || optimisticSessionId;
@@ -1456,6 +1512,8 @@ export function App() {
         const message = visionAgentPrompt(question, await window.harness.vision.stage(attached));
         await window.harness.agent.command("prompt", { message }, targetSession);
       }
+      // 消息已交给 runtime：之后 run 失败不该再把这条退回队列
+      accepted = true;
 
       void (async () => {
         try {
@@ -1493,32 +1551,148 @@ export function App() {
         }
         updateSessions();
       }
-      fillPrompt(question);
+      // 从队列派发失败：退回队首并暂缓自动派发，避免热循环，等用户点「立即发送」
+      if (options?.fromQueue) {
+        restoreQueueHeadOnFailure(queuedPromptFrom(question, attached));
+      } else {
+        fillPrompt(question);
+      }
       setRunning(false);
       if (!/Agent session closed/.test(detail)) setToast(friendlyAgentError(error));
     } finally {
       sending.current = false;
+      dispatchQueueRef.current();
     }
-  }, [ensureModelReady, fillPrompt, loading, openFolder, permission, reconcileOptimisticSession, running, startAgent, queued.length, t, undoLastTurn, updateSessions, workspace]);
+    return accepted;
+  }, [ensureModelReady, dispatchQueueRef, fillPrompt, loading, openFolder, permission, reconcileOptimisticSession, restoreQueueHeadOnFailure, running, startAgent, queued.length, t, undoLastTurn, updateSessions, workspace]);
 
-  useEffect(() => {
-    if (running || loading || sending.current || queueFlush.current || queueHeld.current) return;
-    const next = queuedRef.current[0];
-    if (!next) return;
+  /**
+   * 队列派发器（对照 Proma 的 tryDispatch）：单一幂等入口。
+   * 触发点：sendMessage 收尾、本轮 settle、agent_start、切会话、以及 1.5s 看门狗。
+   * 原实现是一个只依赖 [loading, running, sendMessage] 的 effect + 纯 ref 守卫：
+   * 一旦守卫在那一刻为真（如刚中断过、状态未同步）就再也没人叫醒它，消息就永远躺在队列里。
+   */
+  const dispatchQueuedMessage = useCallback(() => {
+    const target = sessionRef.current || activeSession;
+    const head = queuedRef.current[0];
+    if (
+      !shouldDispatchQueuedMessage({
+        hasPending: Boolean(head),
+        running,
+        targetRunning: target ? pathSetHas(runningSessionsRef.current, target) : false,
+        loading,
+        sending: sending.current,
+        dispatching: queueFlush.current,
+        held: queueHeld.current,
+        missingTarget: !target,
+      })
+    ) {
+      return;
+    }
+    if (!target || !head) return;
     queueFlush.current = true;
     setQueued((current) => {
-      const nextQ = current.slice(1);
+      const next = removeQueuedPrompt(current, head.id);
+      const cached = sessionStates.current.get(target);
+      if (cached) cached.queued = next;
+      return next;
+    });
+    void sendMessage(head.text, head.images, { fromQueue: true })
+      .then((accepted) => {
+        // 未被 runtime 接受（例如刚好在加载历史）→ 退回队首，不静默丢弃
+        if (!accepted) restoreQueueHeadOnFailure(head);
+      })
+      .catch(() => restoreQueueHeadOnFailure(head))
+      .finally(() => {
+        queueFlush.current = false;
+        // 不在这里重入派发：成功刚起跑时 running 可能还没同步，交给 settle 与看门狗
+      });
+  }, [activeSession, loading, restoreQueueHeadOnFailure, running, sendMessage]);
+  dispatchQueueRef.current = dispatchQueuedMessage;
+
+  /**
+   * 「立即插话发送」：Pi runtime 本身就支持 steer（插话进当前这一轮），
+   * 之前渲染层只把消息堆在本地队列、从不调 steer，所以运行中的消息一直发不出去。
+   * 没有活跃 run 时退化为“当下一轮立即发”。
+   */
+  const sendQueuedPromptNow = useCallback(
+    async (index: number) => {
+      const item = queuedRef.current[index];
+      if (!item) return;
       const target = sessionRef.current || activeSession;
-      if (target) {
-        const cached = sessionStates.current.get(target);
-        if (cached) cached.queued = nextQ;
+      if (!target) return;
+      const drop = (id: string) =>
+        setQueued((current) => {
+          const next = removeQueuedPrompt(current, id);
+          const cached = sessionStates.current.get(target);
+          if (cached) cached.queued = next;
+          return next;
+        });
+      const busy = running || pathSetHas(runningSessionsRef.current, target);
+      if (!busy) {
+        // 没在跑：把它提到队首并立刻派发，等同“马上发下一条”
+        setQueued((current) => promoteQueuedPrompt(current, item.id));
+        setQueueHeld(false, target);
+        setTimeout(() => dispatchQueueRef.current(), 0);
+        return;
       }
-      return nextQ;
-    });
-    void sendMessage(next.text, next.images).finally(() => {
-      queueFlush.current = false;
-    });
-  }, [loading, running, sendMessage]);
+      setQueueHeld(false, target);
+      drop(item.id);
+      try {
+        if (item.images?.length && modelSupportsVision(modelRef.current)) {
+          await window.harness.agent.command(
+            "steer",
+            { message: item.text, images: toPromptImages(item.images) },
+            target,
+          );
+        } else {
+          await window.harness.agent.command("steer", { message: item.text }, target);
+        }
+        setToast(t("toast.steeredNow"));
+      } catch (error) {
+        // steer 通道不可用（例如这一轮刚好已经结束）：退回队列，恢复正常派发
+        restoreQueueHeadOnFailure(item);
+        setQueueHeld(false, target);
+        dispatchQueueRef.current();
+        const detail = error instanceof Error ? error.message : String(error);
+        setToast(friendlyAgentError(detail));
+      }
+    },
+    [activeSession, restoreQueueHeadOnFailure, running, setQueueHeld, t],
+  );
+
+  // 看门狗：漏事件、主进程崩溃、导航重载都能自愈；也是队列的兼底叫醒机制。
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const target = sessionRef.current || activeSession;
+      const probe = window.harness.agent.runningSessions?.();
+      if (!probe) {
+        dispatchQueueRef.current();
+        return;
+      }
+      void probe
+        .then((live) => {
+          if (!Array.isArray(live)) return;
+          const next = new Set(live);
+          if (!samePathSet(runningSessionsRef.current, next)) setRunningSessions(next);
+          const targetRunning = target ? pathSetHas(next, target) : false;
+          // 渲染层以为在跑但主进程说空闲：连续两次才拉回，避开“prompt 已发、agent_start 未到”的窗口，
+          // 否则会误把停止按钮换成发送并多起一轮 run。
+          if (target && running && !sending.current && !targetRunning) {
+            idleProbes.current += 1;
+            if (idleProbes.current >= 2) {
+              idleProbes.current = 0;
+              setRunning(false);
+            }
+          } else {
+            idleProbes.current = 0;
+          }
+          dispatchQueueRef.current();
+        })
+        .catch(() => dispatchQueueRef.current());
+    }, 1_500);
+    return () => clearInterval(timer);
+  }, [activeSession, running]);
 
   useEffect(() => {
     void refresh().then((status) => {
@@ -1590,6 +1764,12 @@ export function App() {
           setRunningSessions((prev) => new Set([...prev, sessionRef.current!]));
         }
         if (isCurrent) setRunning(true);
+        if (isCurrent) {
+          // 新一轮正常起跑：清掉上次中断/错误留下的队列暂停，并叫醒派发器
+          queueHeld.current = false;
+          setQueuePaused(false);
+          dispatchQueueRef.current();
+        }
         void window.harness.sessions.list().then(updateSessions);
       }
 
@@ -1614,9 +1794,14 @@ export function App() {
         }
         const cached = sessionStates.current.get(targetKey)!;
         cached.messages = applyAgentEvent(cached.messages, event);
-        if (event.type === "agent_start") cached.running = true;
+        if (event.type === "agent_start") {
+          cached.running = true;
+          // 新的一轮正常开始 = 之前的暂停作废，避免队列被永久冻住
+          cached.queueHeld = false;
+        }
         if (event.type === "agent_settled") {
           cached.running = false;
+          cached.queueHeld = false;
           cached.uiRequest = undefined;
           // Auto-consume background session queue if not paused/held
           if (cached.queued?.length && !isCurrent && !cached.queueHeld) {
@@ -1660,6 +1845,9 @@ export function App() {
         if (event.type === "agent_settled") {
           setRunning(false);
           setUiRequest(undefined);
+          // 正常结束 = 队列恢复：中断/错误造成的暂停不应该把队列永久冻住
+          setQueueHeld(false, sessionRef.current || activeSession);
+          dispatchQueueRef.current();
           void window.harness.agent.command<AgentSessionStats>("get_session_stats", undefined, sessionRef.current).then((nextStats) => {
             if (!live.current) return;
             setStats(nextStats);
@@ -1755,7 +1943,7 @@ export function App() {
         }
       }
       if (isCurrent) {
-        queueHeld.current = true;
+        setQueueHeld(true);
         setRunning(false);
         setUiRequest(undefined);
         setMessages((current) => finalizeInterruptedTurn(current));
@@ -1819,14 +2007,11 @@ export function App() {
       fillToken={promptFill.token}
       onSubmit={(text, images) => void sendMessage(text, images)}
       onStop={() => {
-        queueHeld.current = true;
+        setQueueHeld(true);
         const target = sessionRef.current || activeSession;
         if (target) {
           const cached = sessionStates.current.get(target);
-          if (cached) {
-            cached.queueHeld = true;
-            cached.running = false;
-          }
+          if (cached) cached.running = false;
         }
         setToast(t("toast.stopping"));
         void window.harness.agent.command("abort", undefined, sessionRef.current)
@@ -1836,6 +2021,8 @@ export function App() {
           });
       }}
       steering={queued.map((item) => item.text)}
+      queueHeld={queuePaused}
+      onQueuedSendNow={(index) => void sendQueuedPromptNow(index)}
       onQueuedEdit={(index) => {
         const item = queued[index];
         if (!item) return;
