@@ -138,6 +138,11 @@ export interface AgentSessionStats {
     tokens: number | null;
     contextWindow: number;
     percent: number | null;
+    // [tether-patch 2026-09-22] auto-compaction trigger, exposed by the runtime
+    compactionEnabled?: boolean;
+    compactionReserveTokens?: number;
+    compactionThreshold?: number;
+    thresholdPercent?: number | null;
   };
 }
 
@@ -206,6 +211,13 @@ export interface WorkspaceChange {
   root: string;
   paths: string[];
   truncated: boolean;
+}
+
+/** 外置 checkpoint 载荷（~/.tether/checkpoints/<id>.json 的 checkpoint 字段）。 */
+export interface CheckpointPayload {
+  before?: Array<{ path: string; content: string | null; mode?: number }>;
+  after?: Array<{ path: string; content: string | null; mode?: number }>;
+  patch?: string;
 }
 
 export interface DesktopApi {
@@ -290,6 +302,12 @@ export interface DesktopApi {
     start(options: AgentStartOptions): Promise<AgentSnapshot>;
     stop(sessionPath?: string): Promise<void>;
     command<T = unknown>(type: string, data?: Record<string, unknown>, sessionPath?: string): Promise<T>;
+    /**
+     * 2026-09-27 P1：checkpoint 的文件正文不再写进会话 JSONL，而是落在
+     * `~/.tether/checkpoints/<id>.json`。渲染层只拿会话条目里的索引（stored:true），
+     * 撤销时按 id 现取正文。缺文件 / schema 不符 / 归属别的会话都会抛错。
+     */
+    checkpointPayload(id: string, sessionPath?: string): Promise<CheckpointPayload>;
     respondToUi(id: string, response: Record<string, unknown>, sessionPath?: string): Promise<void>;
     onEvent(listener: (event: AgentEvent) => void): () => void;
     onError(listener: (message: string, sessionPath?: string) => void): () => void;

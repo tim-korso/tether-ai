@@ -440,6 +440,12 @@ export function ContextStats({
     : undefined;
   const contextTokens = stats?.contextUsage?.tokens ?? (stats?.tokens?.total ? stats.tokens.total : undefined);
   const contextWindow = stats?.contextUsage?.contextWindow ?? 128_000;
+  // [tether-patch 2026-09-22] 用压缩阈值进度（而非裸窗口占比）驱动告警分级
+  const compactionEnabled = stats?.contextUsage?.compactionEnabled;
+  const compactionThreshold = stats?.contextUsage?.compactionThreshold;
+  const thresholdPercent = stats?.contextUsage?.thresholdPercent ?? undefined;
+  const gauge = thresholdPercent !== undefined ? Math.round(thresholdPercent * 10) / 10 : percent;
+  const gaugeLevel = gauge === undefined ? undefined : gauge >= 95 ? "hot" : gauge >= 85 ? "warm" : undefined;
   const rate = cacheHitRate(stats?.tokens);
   const canCompact = Boolean(onCompact) && !running && !busy;
   const showCompact = Boolean(onCompact) && percent !== undefined;
@@ -448,9 +454,7 @@ export function ContextStats({
     <div ref={box} className={`context-stats-wrap${open ? " open" : ""}${up ? " up" : ""}`}>
       <button
         type="button"
-        className={`stats-toggle${open ? " on" : ""}${
-          percent !== undefined && percent >= 90 ? " hot" : percent !== undefined && percent >= 80 ? " warm" : ""
-        }`}
+        className={`stats-toggle${open ? " on" : ""}${gaugeLevel ? ` ${gaugeLevel}` : ""}`}
         aria-label={t("context.monitor")}
         title={t("context.monitor")}
         onClick={() => setOpen((was) => !was)}
@@ -496,7 +500,7 @@ export function ContextStats({
                     cy="24"
                     r="20"
                     fill="none"
-                    stroke={percent >= 90 ? "var(--red)" : percent >= 80 ? "var(--accent)" : "var(--green)"}
+                    stroke={gauge !== undefined && gauge >= 95 ? "var(--red)" : gauge !== undefined && gauge >= 85 ? "var(--accent)" : "var(--green)"}
                     strokeWidth="3"
                     strokeDasharray={125.66}
                     strokeDashoffset={125.66 - (Math.min(100, Math.max(0, percent)) / 100) * 125.66}
@@ -515,15 +519,22 @@ export function ContextStats({
               <span className="context-ratio">
                 {contextTokens !== undefined ? formatCompactNumber(contextTokens) : "—"} / {formatCompactNumber(contextWindow)}
               </span>
-              <small className={`context-hint ${percent && percent >= 80 ? "warn" : ""}`}>
-                {percent === undefined
+              <small className={`context-hint ${gaugeLevel === "hot" ? "warn" : ""}`}>
+                {percent === undefined || gauge === undefined
                   ? t("context.waitFirst")
-                  : percent >= 90
+                  : gauge >= 95
                     ? t("context.critical")
-                    : percent >= 75
+                    : gauge >= 85
                       ? t("context.high")
                       : t("context.ok")}
               </small>
+              {compactionEnabled !== undefined && (
+                <small className="context-threshold">
+                  {compactionEnabled && compactionThreshold
+                    ? `${t("context.compactThreshold", { threshold: formatCompactNumber(compactionThreshold) })} · ${t("context.compactProgress", { percent: gauge !== undefined ? gauge.toFixed(0) : "—" })}`
+                    : t("context.compactOff")}
+                </small>
+              )}
             </div>
             {showCompact && (
               <button

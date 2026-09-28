@@ -4,6 +4,7 @@ import type {
   AgentEvent,
   AgentSessionStats,
   AgentSnapshot,
+  CheckpointPayload,
   ExtensionUiRequest,
   PermissionMode,
   ProviderStatus,
@@ -48,6 +49,7 @@ import {
   type ConversationGroupCache,
   lastTurnRestoreFiles,
   mentionedFiles,
+  neededCheckpointIds,
   normalizeMessages,
   optimisticUserMessage,
   planAwaitingApproval,
@@ -102,6 +104,21 @@ function sessionFileOf(snapshot: AgentSnapshot): string | undefined {
   if (typeof snapshot.stats?.sessionFile === "string") return snapshot.stats.sessionFile;
   if (typeof snapshot.state.sessionFile === "string") return snapshot.state.sessionFile;
   return undefined;
+}
+
+/**
+ * P1：撤销前把外置的 checkpoint 正文取回来（会话条目里只有索引）。
+ * 返回 undefined 表示这条会话没有任何需要 hydration 的 checkpoint（老会话内联正文）。
+ */
+async function loadCheckpointPayloads(
+  entries: Parameters<typeof lastTurnRestoreFiles>[0],
+  sessionPath?: string,
+): Promise<Map<string, CheckpointPayload> | undefined> {
+  const ids = neededCheckpointIds(entries);
+  if (ids.length === 0) return undefined;
+  const payloads = new Map<string, CheckpointPayload>();
+  for (const id of ids) payloads.set(id, await window.harness.agent.checkpointPayload(id, sessionPath));
+  return payloads;
 }
 
 function isSessionInSet(session: SessionSummary, set: Set<string>): boolean {
@@ -1248,7 +1265,11 @@ export function App() {
     }
     try {
       const log = await window.harness.agent.command<{ entries: Parameters<typeof lastTurnRestoreFiles>[0] }>("get_entries", undefined, sessionRef.current);
-      const files = lastTurnRestoreFiles(log.entries ?? []);
+      const entries = log.entries ?? [];
+      // P1：checkpoint 正文在 ~/.tether/checkpoints/<id>.json 里，会话条目只有索引。
+      // 取回正文后再算撤销文件；任何一份载荷缺失都会在这里抛错（宁可报错也别少撤几个文件）。
+      const payloads = await loadCheckpointPayloads(entries, sessionRef.current);
+      const files = lastTurnRestoreFiles(entries, payloads);
       if (files.length === 0) {
         setToast(t("toast.nothingToUndo"));
         return;

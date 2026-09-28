@@ -1,4 +1,4 @@
-import type { AgentEvent, PermissionMode, SessionSummary } from "../shared/types";
+import type { AgentEvent, CheckpointPayload, PermissionMode, SessionSummary } from "../shared/types";
 import { sameUserSkillTurn } from "../shared/skills";
 import { parseWebSearchCard } from "../shared/integrations";
 import { DEFAULT_LOCALE, t, type Locale, type MessageKey } from "../shared/i18n";
@@ -223,8 +223,15 @@ export type SessionEntryLike = {
   message?: { role?: string; content?: unknown };
 };
 
-/** Earliest `before` per path after the last real user turn. `/undo` only restores the newest checkpoint. */
-export function lastTurnRestoreFiles(entries: SessionEntryLike[]): RestoreFile[] {
+/**
+ * The checkpoints `/undo` could still restore: those after the last real user turn
+ * (a typed `/undo` does not count as a turn), minus the ones already undone.
+ * `neededCheckpointIds` and `lastTurnRestoreFiles` both walk this same list, so the
+ * sidecar fetch and the restore can never disagree about which checkpoints matter.
+ */
+function pendingUndoCheckpoints(
+  entries: SessionEntryLike[],
+): Array<{ id: string; data: JsonRecord }> {
   const undone = new Set<string>();
   for (const entry of entries) {
     if (entry.type !== "custom" || !isCheckpointUndo(entry.customType) || !isRecord(entry.data)) continue;
@@ -237,12 +244,37 @@ export function lastTurnRestoreFiles(entries: SessionEntryLike[]): RestoreFile[]
     if (entryUserText(entry.message.content).trim() === "/undo") continue;
     start = index + 1;
   }
-  const byPath = new Map<string, RestoreFile>();
+  const pending: Array<{ id: string; data: JsonRecord }> = [];
   for (let index = start; index < entries.length; index += 1) {
     const entry = entries[index]!;
     if (entry.type !== "custom" || !isCheckpoint(entry.customType) || !isRecord(entry.data)) continue;
     if (typeof entry.data.id !== "string" || undone.has(entry.data.id) || !Array.isArray(entry.data.before)) continue;
-    for (const file of entry.data.before) {
+    pending.push({ id: entry.data.id, data: entry.data });
+  }
+  return pending;
+}
+
+/**
+ * P1：会话条目对 sidecar 化的 checkpoint 只留索引（`stored: true`），正文在
+ * `~/.tether/checkpoints/<id>.json`。撤销前要先按这些 id 把正文取回来。
+ */
+export function neededCheckpointIds(entries: SessionEntryLike[]): string[] {
+  const ids = pendingUndoCheckpoints(entries)
+    .filter(({ data }) => data.stored === true)
+    .map(({ id }) => id);
+  return [...new Set(ids)];
+}
+
+/** Earliest `before` per path after the last real user turn. `/undo` only restores the newest checkpoint. */
+export function lastTurnRestoreFiles(
+  entries: SessionEntryLike[],
+  payloads?: Map<string, CheckpointPayload>,
+): RestoreFile[] {
+  const byPath = new Map<string, RestoreFile>();
+  for (const { id, data } of pendingUndoCheckpoints(entries)) {
+    const before = payloads?.get(id)?.before ?? data.before;
+    if (!Array.isArray(before)) continue;
+    for (const file of before) {
       if (!isRecord(file) || typeof file.path !== "string" || byPath.has(file.path)) continue;
       if (file.content !== null && typeof file.content !== "string") continue;
       byPath.set(file.path, {

@@ -28,9 +28,13 @@ const LONG_RUNNING_REQUESTS = new Set([
 
 /**
  * 渲染层只消费消息/工具/状态类事件：`custom` 事件（如 tether-checkpoint 携带整文件 before/after
- * 快照）在 UI 中不落地——聊天视图对 `custom` 直接 bail out，撤销所需正文是 /undo 时通过
- * get_entries 现取的。这类 payload 单条可达 270KB，原样过 IPC 每个补丁都要多付一次序列化与拷贝，
- * 所以超过阈值时只保留可枚举的元数据。
+ * 快照）在 UI 中不落地——聊天视图对 `custom` 直接 bail out。
+ *
+ * 2026-09-27 P1 之后正文已不在会话文件里：`tether-checkpoint` 条目只留索引（path/mode/hash），
+ * 正文落在 `~/.tether/checkpoints/<id>.json`。撤销时渲染层按 id 走 `agent:checkpoint-payload`
+ * 现取（见 main/index.ts），所以这里的瘦身只是防止旧会话（内联正文）把事件流撑爆。
+ * 这类 payload 单条可达 270KB，原样过 IPC 每个补丁都要多付一次序列化与拷贝，
+ * 超过阈值时只保留可枚举的元数据。
  */
 const CUSTOM_EVENT_PAYLOAD_LIMIT = 64 * 1024;
 

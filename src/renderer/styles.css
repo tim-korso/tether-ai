@@ -948,6 +948,12 @@ textarea::selection,
   font-weight: 500;
 }
 
+.context-threshold {
+  font-size: 10.5px;
+  color: var(--ink-3);
+  opacity: 0.85;
+}
+
 .context-section-head {
   display: flex;
   align-items: center;

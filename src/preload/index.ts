@@ -83,6 +83,7 @@ const api: DesktopApi = {
     start: (options) => ipcRenderer.invoke("agent:start", options),
     stop: (sessionPath) => ipcRenderer.invoke("agent:stop", sessionPath),
     command: (type, data, sessionPath) => ipcRenderer.invoke("agent:command", type, data, sessionPath),
+    checkpointPayload: (id, sessionPath) => ipcRenderer.invoke("agent:checkpoint-payload", id, sessionPath),
     respondToUi: (id, response, sessionPath) => ipcRenderer.invoke("agent:ui-response", id, response, sessionPath),
     onEvent: (listener) => subscribe<AgentEvent>("agent:event", listener),
     onError: (listener) => {

@@ -249,6 +249,9 @@ const zh = {
   "context.defaultModel": "默认模型",
   "context.turns": "{n} 轮",
   "context.jumpTurn": "跳转到某一轮对话",
+  "context.compactThreshold": "自动压缩阈值 {threshold}",
+  "context.compactProgress": "阈值进度 {percent}%",
+  "context.compactOff": "自动压缩未启用（/compact 手动）",
 
   "think.live": "思考中…",
   "think.starting": "正在启动会话…",
@@ -751,6 +754,9 @@ const en: Record<MessageKey, string> = {
   "context.defaultModel": "Default model",
   "context.turns": "{n} turns",
   "context.jumpTurn": "Jump to a turn",
+  "context.compactThreshold": "Auto-compact at {threshold}",
+  "context.compactProgress": "{percent}% of threshold",
+  "context.compactOff": "Auto-compaction off (use /compact)",
 
   "think.live": "Thinking…",
   "think.starting": "Starting session…",

@@ -20,6 +20,7 @@ import {
   getTetherHome,
   getStoredDeepSeekBaseUrl,
   getStoredModelSelection,
+  getTetherRpcEntryPath,
   initializeTetherHome,
   listTetherThreads,
   TetherStateStore,
@@ -34,6 +35,7 @@ import {
   type SupportedProviderId,
 } from "tether-agent-core";
 import { AgentHostManager } from "./agent-host-manager";
+import { reapOrphanedAgentHosts } from "./agent-orphans";
 import {
   isIgnoredWatchPath,
   parseWorkspaceIgnore,
@@ -94,6 +96,7 @@ import {
   UPLOADS_HOST,
   type AgentSnapshot,
   type AgentStartOptions,
+  type CheckpointPayload,
   type ProviderStatus,
   type SessionSummary,
   type UpdateCheckResult,
@@ -1180,6 +1183,12 @@ function registerIpc(): void {
     if (!sessionPath) activeSessionPath = undefined;
     return hostManager!.stop(sessionPath);
   });
+  // 2026-09-27 P1：checkpoint 载荷外置后，撤销所需的文件正文不在会话 JSONL 里。
+  // 渲染层只带 id 过来，主进程按 id 读 ~/.tether/checkpoints/<id>.json。
+  // 这里刻意不整目录扫描、不缓存：一次 readFile 对应一次撤销请求。
+  ipcMain.handle("agent:checkpoint-payload", (_event, id: string, sessionPath?: string) =>
+    readCheckpointPayload(id, sessionPath),
+  );
   ipcMain.handle(
     "agent:command",
     async (
@@ -1621,6 +1630,44 @@ function sessionFileFromUnknown(value: unknown): string | undefined {
   return typeof value.sessionFile === "string" ? value.sessionFile : undefined;
 }
 
+/** 与 tether-agent-core/dist/checkpoint.js 的外置载荷契约保持一致（那边是写入方）。 */
+const CHECKPOINT_PAYLOAD_SCHEMA = "tether-checkpoint-payload@1";
+const CHECKPOINT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * 读一份外置 checkpoint 载荷。缺文件 / 无权限 / 解析失败 / schema 不符 / 归属别的会话
+ * 都抛错 —— 静默返回空会让撤销悄悄少撤几个文件，比报错危险得多。
+ */
+async function readCheckpointPayload(id: string, sessionPath?: string): Promise<CheckpointPayload> {
+  if (typeof id !== "string" || !CHECKPOINT_ID_PATTERN.test(id))
+    throw new Error(`Invalid checkpoint id: ${String(id)}`);
+  const file = path.join(getTetherHome(), "checkpoints", `${id}.json`);
+  let raw: string;
+  try {
+    raw = await fsp.readFile(file, "utf8");
+  } catch {
+    throw new Error(`Checkpoint ${id} is missing from ${file}; it can no longer be restored.`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`Checkpoint ${id} is corrupt (${file}).`);
+  }
+  if (!parsed || typeof parsed !== "object" || (parsed as { schema?: unknown }).schema !== CHECKPOINT_PAYLOAD_SCHEMA)
+    throw new Error(`Checkpoint ${id} has an unexpected payload schema.`);
+  const record = parsed as { sessionFile?: unknown; checkpoint?: unknown };
+  if (
+    sessionPath &&
+    typeof record.sessionFile === "string" &&
+    path.basename(record.sessionFile) !== path.basename(sessionPath)
+  )
+    throw new Error(`Checkpoint ${id} belongs to a different session.`);
+  if (!record.checkpoint || typeof record.checkpoint !== "object")
+    throw new Error(`Checkpoint ${id} payload has no checkpoint body.`);
+  return record.checkpoint as CheckpointPayload;
+}
+
 function isWorkspaceItem(value: unknown): value is WorkspaceItem {
   return Boolean(
     value &&
@@ -1805,6 +1852,18 @@ async function listWorkspaceFilesCached(root: string): Promise<string[]> {
 
 app.whenReady().then(async () => {
   await initializeTetherHome();
+  // 上一次进程若被 SIGKILL（内存压力下 Jetsam 会这么干），before-quit 不会跑，
+  // detached 的 rpc-entry 就成了 ppid=1 的孤儿，继续攥着 session.jsonl 和模型连接，
+  // 让新会话写不进去（「点了发送没反应」）。启动时先清一遍，只杀 ppid=1 的真孤儿。
+  void reapOrphanedAgentHosts(getTetherRpcEntryPath())
+    .then((report) => {
+      if (report.reaped.length > 0 || report.failed.length > 0)
+        logPerf(
+          `orphans:reap found=${report.reaped.length} failed=${report.failed.length}` +
+            (report.reaped.length > 0 ? ` pids=${report.reaped.map((p) => p.pid).join(",")}` : ""),
+        );
+    })
+    .catch((error) => logPerf(`orphans:reap error=${error instanceof Error ? error.message : error}`));
   await loadLocale();
   void pruneStagedUploads();
   protocol.handle(PREVIEW_SCHEME, servePreview);

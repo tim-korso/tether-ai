@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { visionAgentPrompt } from "../shared/vision-api";
-import { applyAgentEvent, approvalTitle, assistantErrorRecovered, assistantGroupSucceeded, assistantReplyText, baseName, cacheHitRate, collectFileChanges, collectTodos, collectWorkingFiles, delegateProgress, drawerContent, dropLastTurn, filterMentionPaths, formatCommand, formatThinking, friendlyAgentError, groupConversation, hasNewCheckpointUndo, isRecoverableRequestError, isSamePath, isSameSession, isTransientStreamError, lastTurnRestoreFiles, liveStatus, mentionedFiles, normalizeFilePath, normalizeMessages, omitFinalReply, optimisticUserMessage, parseFeaturesJson, plainTextToPromptHtml, planAwaitingApproval, recoverableFailStreaks, repairMarkdownTables, sessionTerminals, sessionTracksFeaturePlan, splitHttpUrls, splitPromptChips, splitPatch, stripEmptyMarkdown, terminalLabel, thoughtSteps, toolErrorText, toolSummary, toolWritePreview, formatToolOutputPreview, takeTrailingUrl, isHttpUrl, urlChipLabel, spliceFileMention, traceRows, turnAnchorId, turnAnchors, turnWork, undoDialogTitle, workspaceRelative, type ChatMessage } from "./conversation";
+import { applyAgentEvent, approvalTitle, assistantErrorRecovered, assistantGroupSucceeded, assistantReplyText, baseName, cacheHitRate, collectFileChanges, collectTodos, collectWorkingFiles, delegateProgress, drawerContent, dropLastTurn, filterMentionPaths, formatCommand, formatThinking, friendlyAgentError, groupConversation, hasNewCheckpointUndo, isRecoverableRequestError, isSamePath, isSameSession, isTransientStreamError, lastTurnRestoreFiles, liveStatus, mentionedFiles, neededCheckpointIds, normalizeFilePath, normalizeMessages, omitFinalReply, optimisticUserMessage, parseFeaturesJson, plainTextToPromptHtml, planAwaitingApproval, recoverableFailStreaks, repairMarkdownTables, sessionTerminals, sessionTracksFeaturePlan, splitHttpUrls, splitPromptChips, splitPatch, stripEmptyMarkdown, terminalLabel, thoughtSteps, toolErrorText, toolSummary, toolWritePreview, formatToolOutputPreview, takeTrailingUrl, isHttpUrl, urlChipLabel, spliceFileMention, traceRows, turnAnchorId, turnAnchors, turnWork, undoDialogTitle, workspaceRelative, type ChatMessage } from "./conversation";
 import type { SessionSummary } from "../shared/types";
 
 describe("conversation events", () => {
@@ -1181,6 +1181,71 @@ describe("conversation events", () => {
     expect(hasNewCheckpointUndo(before, before)).toBe(false);
     expect(hasNewCheckpointUndo(before, [...before, { id: "c", type: "custom", customType: "tether-checkpoint-undone" }])).toBe(true);
     expect(hasNewCheckpointUndo(before, [...before, { id: "c", type: "custom", customType: "tether-checkpoint" }])).toBe(false);
+  });
+
+  it("collects the sidecar ids a P1 checkpoint hid behind stored:true", () => {
+    expect(neededCheckpointIds([
+      { type: "message", message: { role: "user", content: "改" } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "inline", before: [{ path: "a.ts", content: "x" }] } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "s1", stored: true, before: [{ path: "b.ts", hash: "h" }] } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "s2", stored: true, before: [{ path: "c.ts", hash: "h" }] } },
+      { type: "message", message: { role: "user", content: "/undo" } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "s3", stored: true, before: [{ path: "d.ts", hash: "h" }] } },
+    ])).toEqual(["s1", "s2", "s3"]);
+  });
+
+  it("skips pre-turn and undone checkpoints when collecting sidecar ids", () => {
+    expect(neededCheckpointIds([
+      { type: "message", message: { role: "user", content: "旧回合" } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "old", stored: true, before: [{ path: "old.ts", hash: "h" }] } },
+      { type: "message", message: { role: "user", content: "新回合" } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "keep", stored: true, before: [{ path: "keep.ts", hash: "h" }] } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "gone", stored: true, before: [{ path: "gone.ts", hash: "h" }] } },
+      { type: "custom", customType: "tether-checkpoint-undone", data: { checkpointId: "gone" } },
+    ])).toEqual(["keep"]);
+  });
+
+  it("restores from hydrated sidecar payloads instead of the slim session entry", () => {
+    const entries = [
+      { type: "message", message: { role: "user", content: "改" } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "s1", stored: true, before: [{ path: "index.html", hash: "h" }] } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "s2", stored: true, before: [{ path: "style.css", hash: "h" }, { path: "index.html", hash: "h" }] } },
+    ];
+    const payloads = new Map([
+      ["s1", { before: [{ path: "index.html", content: "<old>" }] }],
+      ["s2", { before: [{ path: "style.css", content: "body{}" }, { path: "index.html", content: "<mid>" }] }],
+    ]);
+    expect(lastTurnRestoreFiles(entries, payloads)).toEqual([
+      { path: "index.html", content: "<old>" },
+      { path: "style.css", content: "body{}" },
+    ]);
+  });
+
+  it("hydrates a deletion snapshot (content null) instead of dropping the path", () => {
+    const entries = [
+      { type: "message", message: { role: "user", content: "删" } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "s1", stored: true, before: [{ path: "gone.ts", hash: "h" }] } },
+    ];
+    expect(lastTurnRestoreFiles(entries, new Map([["s1", { before: [{ path: "gone.ts", content: null }] }]])))
+      .toEqual([{ path: "gone.ts", content: null }]);
+  });
+
+  it("does not invent files when a stored checkpoint payload was never fetched", () => {
+    expect(lastTurnRestoreFiles([
+      { type: "message", message: { role: "user", content: "改" } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "s1", stored: true, before: [{ path: "index.html", hash: "h" }] } },
+    ])).toEqual([]);
+  });
+
+  it("keeps pre-P1 inline checkpoints restorable without any payload fetch", () => {
+    expect(neededCheckpointIds([
+      { type: "message", message: { role: "user", content: "改" } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "inline", before: [{ path: "a.ts", content: "x" }] } },
+    ])).toEqual([]);
+    expect(lastTurnRestoreFiles([
+      { type: "message", message: { role: "user", content: "改" } },
+      { type: "custom", customType: "tether-checkpoint", data: { id: "inline", before: [{ path: "a.ts", content: "x" }] } },
+    ])).toEqual([{ path: "a.ts", content: "x" }]);
   });
 
   it("rewrites undo confirm titles to the last user turn", () => {

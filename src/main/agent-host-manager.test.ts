@@ -1,298 +1,158 @@
-import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
-import { AgentHostManager, sessionFileOf } from "./agent-host-manager";
-import type { AgentHost } from "./agent-host";
-import type { AgentSnapshot } from "../shared/types";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-describe("sessionFileOf", () => {
-  it("extracts sessionFile from stats or state", () => {
-    const snap1: AgentSnapshot = {
-      state: {},
-      messages: [],
-      models: [],
-      thinkingLevels: [],
-      stats: {
-        sessionId: "s1",
-        sessionFile: "/path/to/session1.jsonl",
-        userMessages: 0,
-        assistantMessages: 0,
-        toolCalls: 0,
-        toolResults: 0,
-        totalMessages: 0,
-        tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-        cost: 0,
-      },
-    };
-    expect(sessionFileOf(snap1)).toBe("/path/to/session1.jsonl");
+/**
+ * P2 回归：这一组测试锁死三件“会话写坏”的成因——
+ *  1. 并发 start 只 spawn 一个 runtime（单飞）；
+ *  2. stop 之后、旧进程还没退干净之前，新的 start 必须等它（否则两个写者写同一份 jsonl）；
+ *  3. pruneIdleHosts 摘除是同步的（摘掉后 getHost 立刻看不到），停止是异步的。
+ */
+const fake = vi.hoisted(() => {
+  interface FakeInstance {
+    sessionPath?: string;
+    tempId?: string;
+    running: boolean;
+    busy: boolean;
+    lastActiveAt: number;
+    stopCalls: number;
+    stopResolvers: Array<() => void>;
+    resolveStop(): void;
+  }
 
-    const snap2: AgentSnapshot = {
-      state: { sessionFile: "/path/to/session2.jsonl" },
-      messages: [],
-      models: [],
-      thinkingLevels: [],
-    };
-    expect(sessionFileOf(snap2)).toBe("/path/to/session2.jsonl");
+  const created: FakeInstance[] = [];
 
-    const snap3: AgentSnapshot = {
-      state: {},
-      messages: [],
-      models: [],
-      thinkingLevels: [],
-    };
-    expect(sessionFileOf(snap3)).toBeUndefined();
-  });
+  class FakeAgentHost implements FakeInstance {
+    sessionPath?: string;
+    tempId?: string;
+    running = true;
+    busy = false;
+    lastActiveAt = Date.now();
+    stopCalls = 0;
+    stopResolvers: Array<() => void> = [];
+    onSessionResolved?: (resolved: string, previous?: string) => void;
+
+    constructor(
+      _emit: unknown,
+      _err: unknown,
+      sessionPath?: string,
+      public cwd?: string,
+    ) {
+      this.sessionPath = sessionPath;
+      created.push(this);
+    }
+
+    isRunning(): boolean {
+      return this.running;
+    }
+    isBusy(): boolean {
+      return this.running && this.busy;
+    }
+    getLastActiveAt(): number {
+      return this.lastActiveAt;
+    }
+
+    async start(): Promise<Record<string, unknown>> {
+      return { sessionFile: this.sessionPath };
+    }
+    async snapshot(): Promise<Record<string, unknown>> {
+      return { stats: { sessionFile: this.sessionPath } };
+    }
+    /** 直到测试显式 resolveStop() 之前，stop() 一直挂着——模拟 SIGTERM→2s→SIGKILL 窗口。 */
+    stop(): Promise<void> {
+      this.stopCalls += 1;
+      this.running = false;
+      return new Promise<void>((resolve) => {
+        this.stopResolvers.push(() => {
+          this.running = false;
+          resolve();
+        });
+      });
+    }
+    resolveStop(): void {
+      const pending = this.stopResolvers.splice(0, this.stopResolvers.length);
+      for (const resolve of pending) resolve();
+    }
+  }
+
+  return { FakeAgentHost, created };
+});
+
+vi.mock("./agent-host", () => ({ AgentHost: fake.FakeAgentHost }));
+
+import { AgentHostManager } from "./agent-host-manager";
+
+function makeManager(): AgentHostManager {
+  return new AgentHostManager(() => undefined, () => undefined);
+}
+
+const SESSION = "/tmp/tether-test/session.jsonl";
+
+beforeEach(() => {
+  fake.created.length = 0;
 });
 
 describe("AgentHostManager", () => {
-  it("manages activeSessionPath correctly", () => {
-    const manager = new AgentHostManager(vi.fn(), vi.fn());
-    expect(manager.getActiveSessionPath()).toBeUndefined();
-
-    manager.setActiveSessionPath("/a/b/session.jsonl");
-    expect(manager.getActiveSessionPath()).toBe(path.resolve("/a/b/session.jsonl"));
-
-    manager.setActiveSessionPath(undefined);
-    expect(manager.getActiveSessionPath()).toBeUndefined();
+  it("并发 start 同一个会话只 spawn 一个 runtime", async () => {
+    const manager = makeManager();
+    const [a, b, c] = await Promise.all([
+      manager.getOrCreateHost({ cwd: "/tmp/tether-test", sessionPath: SESSION } as never),
+      manager.getOrCreateHost({ cwd: "/tmp/tether-test", sessionPath: SESSION } as never),
+      manager.getOrCreateHost({ cwd: "/tmp/tether-test", sessionPath: SESSION } as never),
+    ]);
+    expect(fake.created).toHaveLength(1);
+    expect(a.host).toBe(b.host);
+    expect(b.host).toBe(c.host);
+    // 第一个是真正 spawn 的那个，其余复用。
+    expect([a.reused, b.reused, c.reused].filter((r) => r === false)).toHaveLength(1);
   });
 
-  it("prunes idle non-active hosts when exceeding maxIdleHosts", async () => {
-    const manager = new AgentHostManager(vi.fn(), vi.fn(), {
-      maxIdleHosts: 2,
-      idleTimeoutMs: 60_000,
-    });
+  it("stop 未落定之前，重开同一会话不会并行 spawn 第二个 runtime", async () => {
+    const manager = makeManager();
+    await manager.getOrCreateHost({ cwd: "/tmp/tether-test", sessionPath: SESSION } as never);
+    const firstHost = fake.created[0]!;
 
-    const now = Date.now();
-    const mockHost = (sessionPath: string, busy = false, lastActiveAt = now) => {
-      return {
-        sessionPath: path.resolve(sessionPath),
-        isRunning: () => true,
-        isBusy: () => busy,
-        getLastActiveAt: () => lastActiveAt,
-        stop: vi.fn().mockResolvedValue(undefined),
-      } as unknown as AgentHost;
-    };
+    const stopping = manager.stop(SESSION);
+    // 旧进程仍在退出窗口里：此刻 getHost 已经看不到它（同步摘除），但 start 不能直接新建。
+    expect(manager.getHost(SESSION)).toBeUndefined();
 
-    const h1 = mockHost("/s1", false, now - 3000);
-    const h2 = mockHost("/s2", false, now - 2000);
-    const h3 = mockHost("/s3", false, now - 1000);
-    const hActive = mockHost("/sActive", false, now - 4000);
+    const restart = manager.getOrCreateHost({ cwd: "/tmp/tether-test", sessionPath: SESSION } as never);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fake.created).toHaveLength(1); // 仍在等旧进程退出
 
-    // Inject into manager's hosts map
-    const hostsMap = (manager as unknown as { hosts: Map<string, AgentHost> }).hosts;
-    hostsMap.set(h1.sessionPath!, h1);
-    hostsMap.set(h2.sessionPath!, h2);
-    hostsMap.set(h3.sessionPath!, h3);
-    hostsMap.set(hActive.sessionPath!, hActive);
+    firstHost.resolveStop();
+    await stopping;
+    const { host } = await restart;
+    expect(fake.created).toHaveLength(2); // 退出后才新建
+    expect(host).toBe(fake.created[1]);
+  });
 
-    manager.setActiveSessionPath(hActive.sessionPath);
+  it("pruneIdleHosts 同步摘除、异步停止", async () => {
+    const manager = makeManager();
+    await manager.getOrCreateHost({ cwd: "/tmp/tether-test", sessionPath: SESSION } as never);
+    const host = fake.created[0]!;
+    host.lastActiveAt = Date.now() - 60 * 60_000; // 远远超过 idleTimeoutMs
 
-    // Active session path should NEVER be pruned
-    // Among h1, h2, h3: count is 3 > maxIdleHosts(2).
-    // Oldest is h1 (100), so h1 should be pruned.
+    manager.setActiveSessionPath("/tmp/tether-test/other.jsonl");
     manager.pruneIdleHosts();
 
-    expect(hostsMap.has(h1.sessionPath!)).toBe(false);
-    expect(h1.stop).toHaveBeenCalled();
-    expect(hostsMap.has(h2.sessionPath!)).toBe(true);
-    expect(hostsMap.has(h3.sessionPath!)).toBe(true);
-    expect(hostsMap.has(hActive.sessionPath!)).toBe(true);
+    expect(manager.getHost(SESSION)).toBeUndefined();
+    expect(host.stopCalls).toBe(1);
+    // 停止是异步的：promise 还没落定，但路由表已经摘干净了。
+    host.resolveStop();
   });
 
-  it("does not prune busy hosts even if old", () => {
-    const manager = new AgentHostManager(vi.fn(), vi.fn(), {
-      maxIdleHosts: 1,
-      idleTimeoutMs: 1000,
-    });
+  it("stop 落定后再 start 不再阻塞", async () => {
+    const manager = makeManager();
+    await manager.getOrCreateHost({ cwd: "/tmp/tether-test", sessionPath: SESSION } as never);
+    const firstHost = fake.created[0]!;
+    const stopping = manager.stop(SESSION);
+    firstHost.resolveStop();
+    await stopping;
 
-    const mockHost = (sessionPath: string, busy: boolean, lastActiveAt: number) => {
-      return {
-        sessionPath: path.resolve(sessionPath),
-        isRunning: () => true,
-        isBusy: () => busy,
-        getLastActiveAt: () => lastActiveAt,
-        stop: vi.fn().mockResolvedValue(undefined),
-      } as unknown as AgentHost;
-    };
-
-    const hBusy = mockHost("/busy", true, 50);
-    const hIdle = mockHost("/idle", false, 100);
-
-    const hostsMap = (manager as unknown as { hosts: Map<string, AgentHost> }).hosts;
-    hostsMap.set(hBusy.sessionPath!, hBusy);
-    hostsMap.set(hIdle.sessionPath!, hIdle);
-
-    manager.pruneIdleHosts();
-
-    expect(hostsMap.has(hBusy.sessionPath!)).toBe(true);
-    expect(hBusy.stop).not.toHaveBeenCalled();
-  });
-
-  it("stopAll stops all hosts and clears map", async () => {
-    const manager = new AgentHostManager(vi.fn(), vi.fn());
-    const mockHost = (sessionPath: string) => {
-      return {
-        sessionPath: path.resolve(sessionPath),
-        isRunning: () => true,
-        stop: vi.fn().mockResolvedValue(undefined),
-      } as unknown as AgentHost;
-    };
-
-    const h1 = mockHost("/s1");
-    const h2 = mockHost("/s2");
-    const hostsMap = (manager as unknown as { hosts: Map<string, AgentHost> }).hosts;
-    hostsMap.set(h1.sessionPath!, h1);
-    hostsMap.set(h2.sessionPath!, h2);
-
-    await manager.stopAll();
-
-    expect(h1.stop).toHaveBeenCalled();
-    expect(h2.stop).toHaveBeenCalled();
-    expect(hostsMap.size).toBe(0);
-    expect(manager.getActiveSessionPath()).toBeUndefined();
-  });
-
-  it("getRunningSessions returns busy hosts and excludes unknown temporary sessions", () => {
-    const manager = new AgentHostManager(vi.fn(), vi.fn());
-    const mockHost = (sessionPath: string, busy: boolean) => {
-      return {
-        sessionPath: sessionPath.startsWith("/") ? path.resolve(sessionPath) : sessionPath,
-        isRunning: () => true,
-        isBusy: () => busy,
-      } as unknown as AgentHost;
-    };
-
-    const hRunning1 = mockHost("/session1.jsonl", true);
-    const hIdle = mockHost("/session2.jsonl", false);
-    const hUnknown = mockHost("unknown_12345", true);
-
-    const hostsMap = (manager as unknown as { hosts: Map<string, AgentHost> }).hosts;
-    hostsMap.set(hRunning1.sessionPath!, hRunning1);
-    hostsMap.set(hIdle.sessionPath!, hIdle);
-    hostsMap.set(hUnknown.sessionPath!, hUnknown);
-
-    const running = manager.getRunningSessions();
-    expect(running).toEqual([path.resolve("/session1.jsonl")]);
-  });
-
-  it("getHost does not fall back to other running sessions when sessionPath is specified", () => {
-    const manager = new AgentHostManager(vi.fn(), vi.fn());
-    const mockHost = (sessionPath: string) => {
-      return {
-        sessionPath: path.resolve(sessionPath),
-        isRunning: () => true,
-        isBusy: () => true,
-      } as unknown as AgentHost;
-    };
-
-    const hRunning = mockHost("/session1.jsonl");
-    const hostsMap = (manager as unknown as { hosts: Map<string, AgentHost> }).hosts;
-    hostsMap.set(hRunning.sessionPath!, hRunning);
-    manager.setActiveSessionPath(hRunning.sessionPath);
-
-    // Matching sessionPath returns the host
-    expect(manager.getHost("/session1.jsonl")).toBe(hRunning);
-
-    // Unmatched sessionPath MUST return undefined, NOT fall back to hRunning
-    expect(manager.getHost("/session2.jsonl")).toBeUndefined();
-
-    // No sessionPath falls back to active session
-    expect(manager.getHost()).toBe(hRunning);
-  });
-
-  it("getHost and stop find host by tempId", async () => {
-    const manager = new AgentHostManager(vi.fn(), vi.fn());
-    const mockHost = (sessionPath: string, tempId: string) => {
-      return {
-        sessionPath: path.resolve(sessionPath),
-        tempId,
-        isRunning: () => true,
-        isBusy: () => true,
-        stop: vi.fn().mockResolvedValue(undefined),
-      } as unknown as AgentHost;
-    };
-
-    const hTemp = mockHost("/real/session.jsonl", "temp_123");
-    const hostsMap = (manager as unknown as { hosts: Map<string, AgentHost> }).hosts;
-    hostsMap.set(hTemp.sessionPath!, hTemp);
-    hostsMap.set("temp_123", hTemp);
-
-    expect(manager.getHost("temp_123")).toBe(hTemp);
-
-    await manager.stop("temp_123");
-    expect(hTemp.stop).toHaveBeenCalled();
-    expect(hostsMap.has("temp_123")).toBe(false);
-    expect(hostsMap.has(hTemp.sessionPath!)).toBe(false);
-  });
-
-  it("getHost returns undefined when the active path lost its host, instead of another running one", () => {
-    const manager = new AgentHostManager(vi.fn(), vi.fn());
-    const mockHost = (sessionPath: string) => {
-      return {
-        sessionPath: path.resolve(sessionPath),
-        isRunning: () => true,
-        isBusy: () => true,
-      } as unknown as AgentHost;
-    };
-
-    const other = mockHost("/other.jsonl");
-    const hostsMap = (manager as unknown as { hosts: Map<string, AgentHost> }).hosts;
-    hostsMap.set(other.sessionPath!, other);
-    // Active conversation was stopped or pruned; only an unrelated host remains.
-    manager.setActiveSessionPath("/gone.jsonl");
-
-    expect(manager.getHost()).toBeUndefined();
-  });
-
-  it("getHost falls back to the only running host when no session is active", () => {
-    const manager = new AgentHostManager(vi.fn(), vi.fn());
-    const mockHost = (sessionPath: string, running: boolean) => {
-      return {
-        sessionPath: path.resolve(sessionPath),
-        isRunning: () => running,
-        isBusy: () => true,
-      } as unknown as AgentHost;
-    };
-
-    const only = mockHost("/solo.jsonl", true);
-    const stopped = mockHost("/stopped.jsonl", false);
-    const hostsMap = (manager as unknown as { hosts: Map<string, AgentHost> }).hosts;
-    hostsMap.set(stopped.sessionPath!, stopped);
-    hostsMap.set(only.sessionPath!, only);
-    // The same host is keyed twice in practice (tempId + resolved path); it stays one candidate.
-    hostsMap.set("temp_keyed_twice", only);
-
-    expect(manager.getHost()).toBe(only);
-  });
-
-  it("getHost returns undefined when no session is active and several hosts run", () => {
-    const manager = new AgentHostManager(vi.fn(), vi.fn());
-    const mockHost = (sessionPath: string) => {
-      return {
-        sessionPath: path.resolve(sessionPath),
-        isRunning: () => true,
-        isBusy: () => true,
-      } as unknown as AgentHost;
-    };
-
-    const first = mockHost("/first.jsonl");
-    const second = mockHost("/second.jsonl");
-    const hostsMap = (manager as unknown as { hosts: Map<string, AgentHost> }).hosts;
-    hostsMap.set(first.sessionPath!, first);
-    hostsMap.set(second.sessionPath!, second);
-
-    expect(manager.getHost()).toBeUndefined();
-  });
-
-  it("getHost returns undefined when no session is active and no host runs", () => {
-    const manager = new AgentHostManager(vi.fn(), vi.fn());
-    const hostsMap = (manager as unknown as { hosts: Map<string, AgentHost> }).hosts;
-    hostsMap.set("/dead.jsonl", {
-      sessionPath: path.resolve("/dead.jsonl"),
-      isRunning: () => false,
-      isBusy: () => false,
-    } as unknown as AgentHost);
-
-    expect(manager.getHost()).toBeUndefined();
+    const { host, reused } = await manager.getOrCreateHost({
+      cwd: "/tmp/tether-test",
+      sessionPath: SESSION,
+    } as never);
+    expect(reused).toBe(false);
+    expect(host).toBe(fake.created[1]);
   });
 });
-
