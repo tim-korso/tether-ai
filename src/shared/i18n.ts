@@ -100,6 +100,7 @@ const zh = {
   "nav.sessionMenu": "对话菜单",
   "nav.sectionProjects": "项目",
   "nav.recentActive": "最近活跃",
+  "nav.recoveredFolder": "历史文件夹（不在最近列表中）",
 
   "home.greeting": "今天想做点什么？",
   "suggest.openProject": "打开本地项目",
@@ -591,6 +592,7 @@ const en: Record<MessageKey, string> = {
   "nav.sessionMenu": "Chat menu",
   "nav.sectionProjects": "Projects",
   "nav.recentActive": "Recently active",
+  "nav.recoveredFolder": "Older folder (not in the recent list)",
 
   "home.greeting": "What do you want to work on?",
   "suggest.openProject": "Open a local project",
