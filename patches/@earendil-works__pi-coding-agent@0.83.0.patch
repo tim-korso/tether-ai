@@ -1,0 +1,74 @@
+diff --git a/dist/core/agent-session.js b/dist/core/agent-session.js
+index 02c3567ada40890c280a68909d9a013491219615..e3180f5f529fb9ec5df5811a39650f5aa8c9bf21 100644
+--- a/dist/core/agent-session.js
++++ b/dist/core/agent-session.js
+@@ -1192,6 +1192,11 @@ export class AgentSession {
+      * @throws Error if no auth is configured for the model
+      */
+     async setModel(model) {
++        // [tether-patch 2026-10-03] 已经是当前模型时直接返回：渲染层每次发送都会重发
++        // set_model（ensureModelReady），没有这道闸时每次都 append 一条 model_change
++        // 并重写 settings.json —— 发送重试风暴下实测一分钟 18 条（会话 01a0ff54）。
++        if (modelsAreEqual(this.model, model))
++            return;
+         if (!(await this._modelRuntime.checkAuth(model.provider))) {
+             throw new Error(`No API key for ${model.provider}/${model.id}`);
+         }
+@@ -2567,15 +2572,35 @@ export class AgentSession {
+                 }
+             }
+             if (!hasPostCompactionUsage) {
+-                return { tokens: null, contextWindow, percent: null };
++                const cs = this.settingsManager.getCompactionSettings();
++                const reserve = cs.enabled ? cs.reserveTokens : 0;
++                const th = Math.max(0, contextWindow - reserve);
++                return {
++                    tokens: null,
++                    contextWindow,
++                    percent: null,
++                    compactionEnabled: cs.enabled,
++                    compactionReserveTokens: cs.enabled ? cs.reserveTokens : undefined,
++                    compactionThreshold: th > 0 ? th : undefined,
++                    thresholdPercent: null,
++                };
+             }
+         }
+         const estimate = estimateContextTokens(this.messages);
+         const percent = (estimate.tokens / contextWindow) * 100;
++        // [tether-patch 2026-09-22] Expose the auto-compaction trigger so the UI can
++        // show progress against the real threshold instead of the raw window.
++        const compactionSettings = this.settingsManager.getCompactionSettings();
++        const reserveTokens = compactionSettings.enabled ? compactionSettings.reserveTokens : 0;
++        const threshold = Math.max(0, contextWindow - reserveTokens);
+         return {
+             tokens: estimate.tokens,
+             contextWindow,
+             percent,
++            compactionEnabled: compactionSettings.enabled,
++            compactionReserveTokens: compactionSettings.enabled ? compactionSettings.reserveTokens : undefined,
++            compactionThreshold: threshold > 0 ? threshold : undefined,
++            thresholdPercent: threshold > 0 ? (estimate.tokens / threshold) * 100 : undefined,
+         };
+     }
+     /**
+diff --git a/dist/core/sdk.js b/dist/core/sdk.js
+index 2e8e67c884cf254112eb67a82d8958ec61c0cfa0..363302a75220b55de0f56a38a16f4a96222e5f0a 100644
+--- a/dist/core/sdk.js
++++ b/dist/core/sdk.js
+@@ -189,6 +189,16 @@ export async function createAgentSession(options = {}) {
+                 websocketConnectTimeoutMs,
+                 maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
+                 maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
++                // [tether-patch 2026-09-22] Compaction / branch-summary call streamFn
++                // directly with createSummarizationOptions(), which carries no onPayload,
++                // so the extension's before_provider_request never runs and the outgoing
++                // model id loses its "deepseek/" prefix -> 400 unsupported_model.
++                onPayload: options?.onPayload ?? (async (payload) => {
++                    const runner = extensionRunnerRef.current;
++                    if (!runner?.hasHandlers("before_provider_request"))
++                        return payload;
++                    return runner.emitBeforeProviderRequest(payload);
++                }),
+                 transformHeaders: async (requestHeaders) => {
+                     const headers = mergeProviderAttributionHeaders(model, settingsManager, options?.sessionId, requestHeaders);
+                     return headerRunner?.hasHandlers("before_provider_headers")
