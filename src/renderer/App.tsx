@@ -577,6 +577,10 @@ export function App() {
   effortRef.current = effort;
   const agentModelIdsRef = useRef<string[]>([]);
   const agentModelsRef = useRef<AgentSnapshot["models"]>([]);
+  // The model the agent process is actually running. Refreshed on every get_state sync and every
+  // successful set_model, so the send path can skip a redundant set_model (which would otherwise
+  // append a model_change entry and rewrite settings.json on every single send).
+  const agentModelRef = useRef<string>("");
   const startSeq = useRef(0);
   const permissionBeforePlan = useRef<Exclude<PermissionMode, "plan">>("auto");
 
@@ -608,6 +612,7 @@ export function App() {
       if (typeof stateResp?.model?.id === "string" && stateResp.model.id) {
         setModel(stateResp.model.id);
         modelRef.current = stateResp.model.id;
+        agentModelRef.current = stateResp.model.id;
       }
       await window.harness.agent.command("set_thinking_level", { level: next }, sessionRef.current).catch(() => undefined);
     } catch {
@@ -898,6 +903,7 @@ export function App() {
         if (modelId) {
           setModel(modelId);
           await window.harness.agent.command("set_model", { provider: "deepseek", modelId }, file ?? sessionPath).catch(() => undefined);
+          agentModelRef.current = modelId;
         }
         applyThinkingForModel(modelId);
         const nextEffort = effortRef.current;
@@ -1005,8 +1011,10 @@ export function App() {
     const next = modelRef.current.trim();
     if (!next) return true;
     if (agentModelIdsRef.current.includes(next)) {
+      if (agentModelRef.current === next) return true;
       try {
         await window.harness.agent.command("set_model", { provider: "deepseek", modelId: next }, sessionRef.current);
+        agentModelRef.current = next;
         await syncAgentThinking();
         return true;
       } catch (error) {
@@ -1024,7 +1032,10 @@ export function App() {
     applyThinkingForModel(next);
     if (agentCwd.current && agentModelIdsRef.current.includes(next)) {
       void window.harness.agent.command("set_model", { provider: "deepseek", modelId: next }, sessionRef.current)
-        .then(() => syncAgentThinking())
+        .then(() => {
+          agentModelRef.current = next;
+          return syncAgentThinking();
+        })
         .catch(() => undefined);
     }
     setToast(agentCwd.current ? t("toast.modelNextTurn", { model: next }) : t("toast.modelSwitched", { model: next }));
