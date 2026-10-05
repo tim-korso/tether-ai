@@ -6,7 +6,7 @@ import { previewFileUrl, type AgentSessionStats, type ExtensionUiRequest, type P
 import { skillUserDisplay } from "../shared/skills";
 import { visibleUserText, visionResultSections, visionToolChips } from "../shared/vision-api";
 import { DEEPSEEK_PRESET, activeCustomProfile, defaultCustomProfile, isChatProfileValid, isDeepSeekUrl, isVisionProfileValid, type CustomApiProfile } from "../shared/chat-profiles";
-import { applyTheme, readStoredTheme, THEMES, type ThemeId } from "../shared/theme";
+import { applyTheme, readStoredTheme, vibrancyForTheme, THEMES, type ThemeId } from "../shared/theme";
 import { effortLabelKey, pickEffortOptions, reasoningLevelsAvailable } from "../shared/thinking";
 import { approvalTitle, baseName, cacheHitRate, collectFileChanges, collapseThinking, delegateProgress, delegateStatusLabel, drawerContent, filterMentionPaths, formatCommand, isRecoverableRequestError, liveStatus, omitFinalReply, plainTextToPromptHtml, repairMarkdownTables, splitHttpUrls, splitPatch, stripEmptyMarkdown, spliceFileMention, terminalLabel, toolCommand, toolPath, toolSummary, toolWritePreview, formatToolOutputPreview, traceRows, turnWork, assistantReplyText, webSearchCard, workspaceRelative, type ChatImage, type ChatMessage, type FileChange, type SessionFile, type SessionTerminal, type SessionTodo, type ToolActivity, type TraceRow, type WorkItem } from "./conversation";
 import { tokenizeCode } from "./highlight";
@@ -3354,12 +3354,20 @@ const THEME_LABEL: Record<ThemeId, MessageKey> = {
   white: "settings.themeWhite",
   paper: "settings.themePaper",
   dark: "settings.themeDark",
+  glass: "settings.themeGlass",
+  "glass-red": "settings.themeGlassRed",
+  "glass-amber": "settings.themeGlassAmber",
+  "glass-cosmos": "settings.themeGlassCosmos",
 };
 
 const THEME_DESC: Record<ThemeId, MessageKey> = {
   white: "settings.themeWhiteDesc",
   paper: "settings.themePaperDesc",
   dark: "settings.themeDarkDesc",
+  glass: "settings.themeGlassDesc",
+  "glass-red": "settings.themeGlassRedDesc",
+  "glass-amber": "settings.themeGlassAmberDesc",
+  "glass-cosmos": "settings.themeGlassCosmosDesc",
 };
 
 function settingsNav(t: ReturnType<typeof useI18n>["t"]): Array<{ label: string; items: Array<{ id: SettingsPane; label: string; icon: string }> }> {
@@ -3420,6 +3428,12 @@ export function Login({
   const { t } = useI18n();
   const [pane, setPane] = useState<SettingsPane>("chat");
   const [theme, setTheme] = useState<ThemeId>(readStoredTheme);
+  // Switching a glass hue has to move the native window material too, not just the
+  // CSS palette, or the light hues and the cosmos night sky would share one frost.
+  const pickTheme = (id: ThemeId) => {
+    setTheme(applyTheme(id));
+    void window.harness.app.setVibrancy(vibrancyForTheme(id));
+  };
   const [customProfiles, setCustomProfiles] = useState<CustomApiProfile[]>([]);
   const [activeCustomId, setActiveCustomId] = useState("");
   const [visionProfiles, setVisionProfiles] = useState<CustomApiProfile[]>([]);
@@ -3635,7 +3649,7 @@ export function Login({
                       key={id}
                       type="button"
                       className={`theme-pick theme-pick-${id}${theme === id ? " on" : ""}`}
-                      onClick={() => setTheme(applyTheme(id))}
+                      onClick={() => pickTheme(id)}
                     >
                       <span className="theme-pick-preview" aria-hidden>
                         <span className="theme-pick-side" />

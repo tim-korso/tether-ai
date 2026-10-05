@@ -240,6 +240,8 @@ export interface DesktopApi {
     onUpdateAvailable(listener: (info: { version: string; releaseUrl: string }) => void): () => void;
     getLocale(): Promise<Locale>;
     setLocale(locale: Locale): Promise<void>;
+    /** macOS only: swap the window's native vibrancy material (the glass family). */
+    setVibrancy(material: "under-window" | "hud"): Promise<void>;
   };
   /** Frameless windows off macOS need the renderer to drive the caption buttons. */
   window: {

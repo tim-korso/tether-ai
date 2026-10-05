@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { visionAgentPrompt } from "../shared/vision-api";
-import { applyAgentEvent, approvalTitle, assistantErrorRecovered, assistantGroupSucceeded, assistantReplyText, baseName, cacheHitRate, collectFileChanges, collectTodos, collectWorkingFiles, delegateProgress, drawerContent, dropLastTurn, filterMentionPaths, formatCommand, formatThinking, friendlyAgentError, groupConversation, hasNewCheckpointUndo, isRecoverableRequestError, isSamePath, isSameSession, isTransientStreamError, lastTurnRestoreFiles, liveStatus, mentionedFiles, neededCheckpointIds, normalizeFilePath, normalizeMessages, omitFinalReply, optimisticUserMessage, parseFeaturesJson, plainTextToPromptHtml, planAwaitingApproval, recoverableFailStreaks, repairMarkdownTables, sessionTerminals, sessionTracksFeaturePlan, splitHttpUrls, splitPromptChips, splitPatch, stripEmptyMarkdown, terminalLabel, thoughtSteps, toolErrorText, toolSummary, toolWritePreview, formatToolOutputPreview, takeTrailingUrl, isHttpUrl, urlChipLabel, spliceFileMention, traceRows, turnAnchorId, turnAnchors, turnWork, undoDialogTitle, workspaceRelative, type ChatMessage } from "./conversation";
+import { applyAgentEvent, approvalTitle, assistantErrorRecovered, assistantGroupSucceeded, assistantReplyText, baseName, cacheHitRate, collectFileChanges, collectTodos, collectWorkingFiles, delegateProgress, drawerContent, dropLastTurn, filterMentionPaths, finalizeInterruptedTurn, formatCommand, formatThinking, friendlyAgentError, groupConversation, hasNewCheckpointUndo, hasRunningTool, isRecoverableRequestError, isSamePath, isSameSession, isTransientStreamError, lastTurnRestoreFiles, liveStatus, mentionedFiles, neededCheckpointIds, normalizeFilePath, normalizeMessages, omitFinalReply, optimisticUserMessage, parseFeaturesJson, plainTextToPromptHtml, planAwaitingApproval, recoverableFailStreaks, repairMarkdownTables, sessionTerminals, sessionTracksFeaturePlan, splitHttpUrls, splitPromptChips, splitPatch, stripEmptyMarkdown, terminalLabel, thoughtSteps, toolErrorText, toolSummary, toolWritePreview, formatToolOutputPreview, takeTrailingUrl, isHttpUrl, urlChipLabel, spliceFileMention, traceRows, turnAnchorId, turnAnchors, turnWork, undoDialogTitle, workspaceRelative, type ChatMessage, type ToolActivity } from "./conversation";
 import type { SessionSummary } from "../shared/types";
 
 describe("conversation events", () => {
@@ -1473,5 +1473,71 @@ describe("isSameSession", () => {
     expect(isSameSession(session, "")).toBe(false);
     expect(isSameSession(session, "other")).toBe(false);
     expect(isSameSession(session, "/Users/x/other.jsonl")).toBe(false);
+  });
+});
+
+describe("stale running tool reconciliation", () => {
+  const msg = (over: Partial<ChatMessage>): ChatMessage => ({
+    id: over.id ?? Math.random().toString(36).slice(2),
+    role: "assistant",
+    text: "",
+    images: [],
+    tools: [],
+    work: [],
+    ...over,
+  });
+  const tool = (over: Partial<ToolActivity>): ToolActivity => ({
+    id: over.id ?? Math.random().toString(36).slice(2),
+    name: "exec_command",
+    title: "exec_command",
+    status: "running",
+    ...over,
+  });
+
+  it("detects a running tool even when it is not in the last message", () => {
+    expect(hasRunningTool([
+      msg({ id: "m1", tools: [tool({ id: "t1", status: "running" })] }),
+      msg({ id: "m2", tools: [tool({ id: "t2", status: "complete" })] }),
+      msg({ id: "m3", text: "done" }),
+    ])).toBe(true);
+  });
+
+  it("is false once every tool has settled", () => {
+    expect(hasRunningTool([
+      msg({ id: "m1", tools: [tool({ id: "t1", status: "error" })] }),
+      msg({ id: "m2", tools: [tool({ id: "t2", status: "complete" })] }),
+    ])).toBe(false);
+  });
+
+  it("finalizes a dangling tool in an earlier message, not just the last one", () => {
+    const before = Date.now();
+    const out = finalizeInterruptedTurn([
+      msg({ id: "m1", tools: [tool({ id: "t1", status: "running", startedAt: before - 10_000 })] }),
+      msg({ id: "m2", text: "later turn" }),
+      msg({ id: "m3", text: "newest turn" }),
+    ]);
+    expect(out[0]!.tools[0]).toMatchObject({ status: "error" });
+    expect(out[0]!.tools[0]!.endedAt).toBeGreaterThanOrEqual(before);
+    expect(out[0]!.tools[0]!.output).toBeTruthy();
+    // sanity: the later messages are untouched
+    expect(out[1]!.text).toBe("later turn");
+    expect(out[2]!.text).toBe("newest turn");
+  });
+
+  it("finalizes every dangling tool across multiple messages and turns off streaming", () => {
+    const out = finalizeInterruptedTurn([
+      msg({ id: "m1", streaming: true, tools: [tool({ id: "t1", status: "running" })] }),
+      msg({ id: "m2", tools: [tool({ id: "t2", status: "running" }), tool({ id: "t3", status: "complete" })] }),
+    ]);
+    expect(out[0]!.streaming).toBe(false);
+    expect(out[0]!.tools[0]!.status).toBe("error");
+    expect(out[1]!.tools[0]!.status).toBe("error");
+    expect(out[1]!.tools[1]!.status).toBe("complete");
+  });
+
+  it("leaves already-settled messages strictly unchanged", () => {
+    const input = [msg({ id: "m1", tools: [tool({ id: "t1", status: "complete", endedAt: 123 })] })];
+    const out = finalizeInterruptedTurn(input);
+    expect(out[0]).toBe(input[0]);
   });
 });

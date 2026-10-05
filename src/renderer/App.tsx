@@ -21,7 +21,10 @@ import {
   restoreQueuedPrompt,
   samePathSet,
   shouldDispatchQueuedMessage,
+  shouldReleaseSendLatch,
+  staleRunningSessionKeys,
   type QueuedPrompt,
+  type SendPhase,
 } from "./message-queue";
 import {
   DEFAULT_EFFORT,
@@ -39,6 +42,7 @@ import {
   dropLastTurn,
   finalizeInterruptedTurn,
   friendlyAgentError,
+  hasRunningTool,
   isTransientStreamError,
   assistantErrorRecovered,
   assistantGroupHasRecoverableError,
@@ -419,6 +423,17 @@ interface SessionCacheItem {
 const SESSION_STATE_CACHE_MAX = 12;
 
 /**
+ * 发送门闩（`sending.current`）的最长持有时间。
+ * 发送路径里的 `await` 都挂在主进程 IPC 上（prompt 的 RPC 超时是 30 分钟），一旦 IPC 没有回应，
+ * 门闩就会一直是 true：输入框永久拒绝发送、看门狗也因为 `!sending` 而不敢回落运行态。
+ * 超过这个时限、且主进程权威空闲、且消息没落地，才解闩并把那条消息还给输入框。
+ * 2026-10-05 实测校正：这个时限只管 prompt 阶段。冷启动 spawn agent（可能十几秒）在它之前，
+ * 长会话的同步压缩又在 preflight 里跑（主进程 busy、子进程 isStreaming=false），
+ * 这两种都是「还在飞」，算进时限就会把正常发送误判成卡住 → 输入框被回填、同一句话发两遍。
+ */
+const SEND_LATCH_STALL_MS = 15_000;
+
+/**
  * 会话状态缓存原来只增不减：逛过的每个会话都把完整消息数组留在堆里，长时间运行后渲染进程能涨到 1G+。
  * 这里按“最近使用”只保留少量会话，被淘汰的会话切回去时按需重新加载。
  */
@@ -559,6 +574,12 @@ export function App() {
     trimSessionStateCache(sessionStates.current, [key, sessionRef.current, activeSession]);
   }, [activeSession, agentSkills, messages, queued, running, stats, uiRequest]);
   const sending = useRef(false);
+  // 本次发送的阶段 + 起始时间 + 待确认的那条消息（发送挂死时原样还给输入框）
+  const sendingPhase = useRef<SendPhase>("idle");
+  const sendingSince = useRef(0);
+  const sendingDraft = useRef<{ text: string; images?: string[]; optimisticId?: string } | undefined>(undefined);
+  // 进入 prompt 阶段时目标会话的消息数：涨了说明这条消息已经落地，不能再当成卡死回收
+  const sendingBaselineMessages = useRef(0);
   const queuedRef = useRef(queued);
   queuedRef.current = queued;
   const queueFlush = useRef(false);
@@ -567,6 +588,8 @@ export function App() {
   runningSessionsRef.current = runningSessions;
   // 主进程连续两次报告空闲才认为 run 真的结束（避开起跑窗口的误判）
   const idleProbes = useRef(0);
+  // 每个会话各自的连续空闲计数：缓存 running 的回落按会话独立对账
+  const staleRunningProbes = useRef<Map<string, number>>(new Map());
   // 队列派发器：单一幂等入口，sendMessage 与各个事件触发点都通过这个 ref 调用，
   // 避免「ref 守卫 + 无状态触发」造成的黑洞（排了队却再也没人叫醒派发）。
   const dispatchQueueRef = useRef<() => void>(() => undefined);
@@ -902,12 +925,16 @@ export function App() {
           setRunningSessions((prev) => new Set(prev).add(resolvedTarget));
         } else {
           const raw = normalizeMessages(snapshot.messages);
-          const hadRunning = Boolean(raw.at(-1)?.tools.some((tool) => tool.status === "running"));
+          const hadRunning = hasRunningTool(raw);
           const sessionStillRunning =
             isActivelyStreaming ||
-            isSessionInSet({ path: resolvedTarget, id: resolvedTarget, storagePath: resolvedTarget } as SessionSummary, runningSessions) ||
+            isSessionInSet({ path: resolvedTarget, id: resolvedTarget, storagePath: resolvedTarget } as SessionSummary, runningSessionsRef.current) ||
             Boolean(sessionStates.current.get(resolvedTarget)?.running);
-          const isCurrentlyRunning = sessionStillRunning || hadRunning;
+          // 2026-10-05：hadRunning 读的是会话文件里还挂着的 running 工具，那是中断/压缩留下的历史残影，
+          // 不是实时状态。把它 OR 进运行态，中断过的会话每次打开都会被判成在跑 → 永远「Waiting for model」、
+          // 新输入只能排队发不出去。运行态只看主进程权威状态，残影只用来把这一轮收尾。
+          const interrupted = hadRunning && !sessionStillRunning;
+          const isCurrentlyRunning = sessionStillRunning;
           if (isCurrentlyRunning) {
             setRunningSessions((prev) => new Set(prev).add(resolvedTarget));
           } else {
@@ -918,8 +945,9 @@ export function App() {
             });
           }
           const existingCached = sessionStates.current.get(resolvedTarget);
+          const keepExisting = sessionStillRunning && (existingCached?.messages.length ?? 0) > 0;
           sessionStates.current.set(resolvedTarget, {
-            messages: (!sessionStillRunning || (existingCached?.messages.length ?? 0) === 0) ? raw : (existingCached?.messages ?? raw),
+            messages: interrupted ? finalizeInterruptedTurn(raw) : keepExisting ? (existingCached?.messages ?? raw) : raw,
             running: isCurrentlyRunning,
             stats: snapshot.stats,
             queued: existingCached?.queued ?? queuedRef.current,
@@ -951,19 +979,21 @@ export function App() {
           setRunning(true);
         } else {
           const raw = normalizeMessages(snapshot.messages);
-          const hadRunning = Boolean(raw.at(-1)?.tools.some((tool) => tool.status === "running"));
+          const hadRunning = hasRunningTool(raw);
           const sessionStillRunning =
             Boolean(snapshot.state?.isStreaming || snapshot.state?.isBusy) ||
             Boolean(sessionStates.current.get(resolvedTarget!)?.running);
-          const next = (resume && hadRunning && !sessionStillRunning) ? finalizeInterruptedTurn(raw) : raw;
+          // 同上：悬空残影只用于把这一轮收尾，不再冒充「还在跑」
+          const interrupted = hadRunning && !sessionStillRunning;
+          const next = interrupted ? finalizeInterruptedTurn(raw) : raw;
           if (!sessionStillRunning || messages.length === 0) {
             setMessages(next);
           } else {
             setMessages((current) => (current.length >= next.length ? current : next));
           }
           setStats(snapshot.stats);
-          setRunning(sessionStillRunning || hadRunning);
-          if (resume && hadRunning && !sessionStillRunning) setToast(t("toast.sessionInterrupted"));
+          setRunning(sessionStillRunning);
+          if (resume && interrupted) setToast(t("toast.sessionInterrupted"));
           if (sessionPath && next.length === 0) {
             setToast(t("toast.sessionEmpty"));
           }
@@ -1453,6 +1483,10 @@ export function App() {
     }
     if ((!question && !attached?.length) || loading || sending.current) return false;
     sending.current = true;
+    // 阶段从 starting 起算：冷启动（spawn runtime + 等模型就绪）是正常耗时，不进门闩时限。
+    sendingPhase.current = "starting";
+    sendingSince.current = Date.now();
+    sendingDraft.current = { text: question, images: attached };
     setQueueHeld(false);
     draftRef.current = "";
     const activeKey = sessionRef.current || activeSession;
@@ -1486,6 +1520,7 @@ export function App() {
       optimistic = optimisticUserMessage(question, false, thumbs);
       fillPrompt("");
       setMessages((current) => [...current, optimistic!]);
+      if (sendingDraft.current) sendingDraft.current.optimisticId = optimistic.id;
       setRunning(true);
 
       // If starting a brand new conversation without an active session file:
@@ -1567,6 +1602,14 @@ export function App() {
 
       const targetSession = sessionRef.current || optimisticSessionId;
 
+      // 2026-10-05：计时/阶段从这里切到 prompt，而不是从用户点发送那一刻。
+      // 上面已经 await 过 startAgent（冷启动可能十几秒）与 ensureModelReady，
+      // 那些是正常的启动耗时，不该被下面的门闩看门狗算成「IPC 卡死」。
+      sendingPhase.current = "prompt";
+      sendingSince.current = Date.now();
+      sendingBaselineMessages.current =
+        (targetSession ? sessionStates.current.get(targetSession)?.messages.length : 0) ?? 0;
+
       if (!attached?.length) {
         await window.harness.agent.command("prompt", { message: question }, targetSession);
       } else if (modelSupportsVision(modelRef.current)) {
@@ -1637,6 +1680,8 @@ export function App() {
       if (!/Agent session closed/.test(detail)) setToast(friendlyAgentError(error));
     } finally {
       sending.current = false;
+      sendingPhase.current = "idle";
+      sendingDraft.current = undefined;
       dispatchQueueRef.current();
     }
     return accepted;
@@ -1751,6 +1796,59 @@ export function App() {
           if (!Array.isArray(live)) return;
           const next = new Set(live);
           if (!samePathSet(runningSessionsRef.current, next)) setRunningSessions(next);
+
+          const owner = sessionRef.current || activeSession;
+
+          // 2026-10-05：发送门闩挂在没有回应的 IPC 上时（prompt 的 RPC 超时是 30 分钟），
+          // 它会把输入框和看门狗一起焊死。解闩是破坏性的（回填输入框 + 删乐观消息），
+          // 所以判定必须排除「还在飞」：冷启动阶段不计时，主进程说这个会话还在跑就必须等。
+          if (
+            sending.current &&
+            shouldReleaseSendLatch({
+              phase: sendingPhase.current,
+              elapsedMs: Date.now() - sendingSince.current,
+              stallMs: SEND_LATCH_STALL_MS,
+              mainBusy: target ? pathSetHas(next, target) : false,
+              landed:
+                (target ? sessionStates.current.get(target)?.messages.length ?? 0 : 0) >
+                sendingBaselineMessages.current,
+            })
+          ) {
+            sending.current = false;
+            sendingPhase.current = "idle";
+            const draft = sendingDraft.current;
+            sendingDraft.current = undefined;
+            if (draft) {
+              if (draft.optimisticId) {
+                setMessages((current) => current.filter((item) => item.id !== draft.optimisticId));
+              }
+              fillPrompt(draft.text);
+              setToast(t("toast.sendStalled"));
+            }
+          }
+
+          // 发送在途时不碰运行态：那几轮主进程也报空闲，回落会误伤刚起跑的 run。
+          if (!sending.current) {
+            // 缓存层的 running 只靠事件回落，漏一次 agent_settled 就会永久粘住（切回该会话永远
+            // 「Waiting for model」）。这里按会话逐个对账主进程的权威集合，连续两轮空闲才回落。
+            const staleKeys = staleRunningSessionKeys(
+              Array.from(sessionStates.current, ([key, item]) => ({ key, running: item.running })),
+              next,
+              staleRunningProbes.current,
+            );
+            for (const key of staleKeys) {
+              const cached = sessionStates.current.get(key);
+              if (!cached) continue;
+              cached.running = false;
+              cached.queueHeld = false;
+              cached.messages = finalizeInterruptedTurn(cached.messages);
+              if (owner && isSamePath(key, owner)) {
+                setMessages((current) => finalizeInterruptedTurn(current));
+                setQueueHeld(false, key);
+              }
+            }
+          }
+
           const targetRunning = target ? pathSetHas(next, target) : false;
           // 渲染层以为在跑但主进程说空闲：连续两次才拉回，避开“prompt 已发、agent_start 未到”的窗口，
           // 否则会误把停止按钮换成发送并多起一轮 run。
@@ -1768,7 +1866,7 @@ export function App() {
         .catch(() => dispatchQueueRef.current());
     }, 1_500);
     return () => clearInterval(timer);
-  }, [activeSession, running]);
+  }, [activeSession, fillPrompt, running, setQueueHeld, t]);
 
   useEffect(() => {
     void refresh().then((status) => {

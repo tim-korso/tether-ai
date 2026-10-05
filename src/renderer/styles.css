@@ -4272,7 +4272,10 @@ textarea::selection,
 }
 .theme-picks {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  /* auto-fit so the track count follows the number of themes: four swatches stay
+     on one row in the default 632px pane, and drop to 2/3 columns in narrow
+     windows instead of leaving an orphan card on a half-empty row. */
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 10px;
   padding: 1px;
 }
@@ -5165,5 +5168,309 @@ kbd {
   .trace.live .shimmer,
   .caret {
     animation: none;
+  }
+}
+
+/* ============================================================================
+   Glass theme family — macOS native vibrancy
+   ----------------------------------------------------------------------------
+   On macOS the window itself is an NSVisualEffectView (see src/main/index.ts:
+   transparent + vibrancy), so nothing in the shell may paint an opaque ground —
+   the desktop shows through the blur. Every rule below is scoped with
+   [data-theme|="glass"], which matches "glass" and every "glass-*" hue alike,
+   and the block sits after all other rules, so white / paper / dark keep their
+   original declarations untouched.
+
+   One scaffold, four hues: the base palette, the blur recipe and the transport
+   rules are shared, and only the five --glass-* tokens below differ per hue.
+   Adding a hue is one palette block here plus an entry in THEMES. The three
+   light hues ride the pale "under-window" material and cosmos swaps to the dark
+   "hud" material — see vibrancyForTheme() in src/shared/theme.ts.
+
+   The --glass-ground / --glass-surface gradients deliberately keep their last
+   stop translucent: opaque there and the whole theme collapses into a flat page.
+   ============================================================================ */
+[data-theme|="glass"] {
+  /* Neutral base, shared by the three light hues. Cosmos is a dark palette and
+     overrides this whole block further down. */
+  --page: #eef1f7;
+  --canvas: #e3e9f3;
+  --surface: #f8fafc;
+  --inset: #ecf1f8;
+  --hover: #e1e8f2;
+  --hover-2: #d3dcea;
+  --ink: #1b2432;
+  --ink-2: #4a5568;
+  --ink-3: #94a3b8;
+  --line: #dae2ee;
+  --line-strong: #c6d2e2;
+  --field: #ecf1f8;
+  --accent: #1b2432;
+  --accent-ink: #0f1720;
+  --accent-tint: #e7edf6;
+  --brand: #4a74d4;
+  --green: #2f7d4a;
+  --green-tint: #e7f3eb;
+  --red: #c4473a;
+  --red-tint: #f8ecea;
+  color-scheme: light;
+
+  --glass-blur: blur(20px) saturate(1.08);
+  --glass-blur-chrome: blur(24px) saturate(1.1);
+  background: transparent;
+}
+
+/* --- Hue palettes: the only per-hue block ---------------------------------- */
+
+/* Blue: two radial "light leak" washes over a translucent vertical gradient. */
+[data-theme="glass"] {
+  --brand: #3f74e8;
+  --glass-ground:
+    radial-gradient(1200px 820px at 6% -14%, color-mix(in srgb, #2f74ff 60%, transparent), transparent 68%),
+    radial-gradient(1050px 760px at 104% -8%, color-mix(in srgb, #7db6ff 66%, transparent), transparent 62%),
+    linear-gradient(180deg, color-mix(in srgb, #b6d2ff 30%, transparent) 0%, color-mix(in srgb, #dceaff 20%, transparent) 100%);
+  --glass-surface: linear-gradient(160deg, color-mix(in srgb, #b9d3ff 46%, transparent), color-mix(in srgb, #d8e7ff 34%, transparent));
+  --glass-chrome: color-mix(in srgb, #a9c8fb 50%, transparent);
+  --glass-panel: color-mix(in srgb, #e6eefb 70%, transparent);
+  --glass-rim: color-mix(in srgb, #2f4f86 24%, transparent);
+}
+
+/* Red: the same scaffold, hue rotated to a warm rose. */
+[data-theme="glass-red"] {
+  --brand: #c4555f;
+  --glass-ground:
+    radial-gradient(1200px 820px at 6% -14%, color-mix(in srgb, #ff3b52 52%, transparent), transparent 68%),
+    radial-gradient(1050px 760px at 104% -8%, color-mix(in srgb, #ff9aa8 62%, transparent), transparent 62%),
+    linear-gradient(180deg, color-mix(in srgb, #ffc9cf 28%, transparent) 0%, color-mix(in srgb, #ffe3e6 18%, transparent) 100%);
+  --glass-surface: linear-gradient(160deg, color-mix(in srgb, #ffc4cb 42%, transparent), color-mix(in srgb, #ffdee1 30%, transparent));
+  --glass-chrome: color-mix(in srgb, #ffb3bd 48%, transparent);
+  --glass-panel: color-mix(in srgb, #fde8ea 70%, transparent);
+  --glass-rim: color-mix(in srgb, #8a2a38 24%, transparent);
+}
+
+/* Amber: the warm gold end of the wheel. */
+[data-theme="glass-amber"] {
+  --brand: #b0801e;
+  --glass-ground:
+    radial-gradient(1200px 820px at 6% -14%, color-mix(in srgb, #ffa219 55%, transparent), transparent 68%),
+    radial-gradient(1050px 760px at 104% -8%, color-mix(in srgb, #ffd98a 64%, transparent), transparent 62%),
+    linear-gradient(180deg, color-mix(in srgb, #ffe0a8 30%, transparent) 0%, color-mix(in srgb, #fff3d8 20%, transparent) 100%);
+  --glass-surface: linear-gradient(160deg, color-mix(in srgb, #ffdb9e 44%, transparent), color-mix(in srgb, #ffeed2 32%, transparent));
+  --glass-chrome: color-mix(in srgb, #ffd190 50%, transparent);
+  --glass-panel: color-mix(in srgb, #fdf0da 72%, transparent);
+  --glass-rim: color-mix(in srgb, #8a6412 26%, transparent);
+}
+
+/* Cosmos: a night sky. It is the only dark member, so it overrides the shared
+   base tokens as well — page, ink and line all flip — and its rim stays a light
+   hairline because these surfaces are darker than the border. */
+[data-theme="glass-cosmos"] {
+  --page: #0d1020;
+  --canvas: #090b16;
+  --surface: #151a2e;
+  --inset: #111527;
+  --hover: #1d2340;
+  --hover-2: #2a3157;
+  --ink: #e9edff;
+  --ink-2: #a9b2da;
+  --ink-3: #6d76a3;
+  --line: #262c4c;
+  --line-strong: #363d68;
+  --field: #111527;
+  --accent: #d7ddff;
+  --accent-ink: #0b0d18;
+  --accent-tint: #1d2340;
+  --brand: #8fa4ff;
+  --green: #47c98d;
+  --green-tint: #10281c;
+  --red: #ff7580;
+  --red-tint: #2b1418;
+  color-scheme: dark;
+
+  --glass-ground:
+    radial-gradient(1200px 900px at 8% -16%, color-mix(in srgb, #5b46e0 60%, transparent), transparent 66%),
+    radial-gradient(1000px 820px at 102% -6%, color-mix(in srgb, #1f6fd0 50%, transparent), transparent 62%),
+    radial-gradient(900px 700px at 50% 118%, color-mix(in srgb, #b34bd0 34%, transparent), transparent 72%),
+    linear-gradient(180deg, color-mix(in srgb, #1a1f3c 78%, transparent) 0%, color-mix(in srgb, #0a0c16 84%, transparent) 100%);
+  --glass-surface: linear-gradient(160deg, color-mix(in srgb, #2a2f52 60%, transparent), color-mix(in srgb, #161a2e 72%, transparent));
+  --glass-chrome: color-mix(in srgb, #191e36 74%, transparent);
+  --glass-panel: color-mix(in srgb, #171c33 84%, transparent);
+  --glass-rim: color-mix(in srgb, #8fa4ff 24%, transparent);
+}
+
+/* --- Shared transport: which element carries which layer -------------------- */
+
+/* body's background is what normally paints the canvas, so it has to go too. */
+[data-theme|="glass"] body {
+  background: transparent;
+}
+
+[data-theme|="glass"] .app {
+  background: var(--glass-ground);
+  background-attachment: fixed;
+}
+
+[data-theme|="glass"] .sidebar {
+  background: var(--glass-chrome);
+  border-right-color: var(--glass-rim);
+  -webkit-backdrop-filter: var(--glass-blur-chrome);
+  backdrop-filter: var(--glass-blur-chrome);
+}
+
+[data-theme|="glass"] .chat {
+  background: var(--glass-surface);
+}
+
+/* Pane wash, not an opaque sheet: the .chat ground has to read through so
+   scrolling content dims toward the window's glass instead of toward a page. */
+[data-theme|="glass"] .conversation {
+  background: transparent;
+}
+
+[data-theme|="glass"] .chat-bar {
+  background: var(--glass-chrome);
+  -webkit-backdrop-filter: var(--glass-blur-chrome);
+  backdrop-filter: var(--glass-blur-chrome);
+  box-shadow: inset 0 -1px 0 var(--glass-rim);
+}
+
+[data-theme|="glass"] .settings-nav {
+  background: var(--glass-surface);
+  border-right-color: var(--glass-rim);
+}
+
+/* Floating surfaces. Menus already carry a hairline border, so it is only
+   recoloured; the ones that never had one get an inset ring instead of a real
+   border so their geometry stays identical to the other themes. */
+[data-theme|="glass"] .session-menu,
+[data-theme|="glass"] .account-menu,
+[data-theme|="glass"] .account-submenu,
+[data-theme|="glass"] .context-popover {
+  border-color: var(--glass-rim);
+  background: var(--glass-panel);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--shadow-overlay), inset 0 0.5px 0 var(--glass-rim);
+}
+
+[data-theme|="glass"] .combo-menu,
+[data-theme|="glass"] .permission-menu,
+[data-theme|="glass"] .panel,
+[data-theme|="glass"] .settings,
+[data-theme|="glass"] .drawer {
+  background: var(--glass-panel);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--shadow-overlay), inset 0 0 0 1px var(--glass-rim);
+}
+
+/* Full-bleed sheet: stays opaque so the page never shows through a document. */
+[data-theme|="glass"] .drawer.wide {
+  background: var(--surface);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+}
+
+[data-theme|="glass"] .prompt {
+  background: var(--glass-panel);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--shadow-card), inset 0 0 0 1px var(--glass-rim);
+}
+[data-theme|="glass"] .prompt:focus-within {
+  box-shadow: var(--shadow-overlay), inset 0 0 0 1px var(--glass-rim);
+}
+[data-theme|="glass"] .prompt.drop {
+  box-shadow:
+    0 0 0 1.5px var(--ink),
+    var(--shadow-card),
+    inset 0 0 0 1px var(--glass-rim);
+}
+
+/* --- Appearance picker swatches (settings › appearance) --------------------- */
+.theme-pick-glass .theme-pick-preview {
+  background: linear-gradient(160deg, #dbe7ff, #c2d6fb);
+  border-color: #b3caf2;
+}
+.theme-pick-glass .theme-pick-side {
+  background: #b9d3ff;
+}
+.theme-pick-glass .theme-pick-main {
+  background: #e2ecfe;
+}
+.theme-pick-glass .theme-pick-bar,
+.theme-pick-glass .theme-pick-bubble {
+  background: #c2d6fb;
+}
+.theme-pick-glass .theme-pick-bubble.user {
+  background: #3f74e8;
+}
+
+.theme-pick-glass-red .theme-pick-preview {
+  background: linear-gradient(160deg, #ffdfe2, #ffc3ca);
+  border-color: #f7b0ba;
+}
+.theme-pick-glass-red .theme-pick-side {
+  background: #ffb3bd;
+}
+.theme-pick-glass-red .theme-pick-main {
+  background: #ffe6e8;
+}
+.theme-pick-glass-red .theme-pick-bar,
+.theme-pick-glass-red .theme-pick-bubble {
+  background: #ffc3ca;
+}
+.theme-pick-glass-red .theme-pick-bubble.user {
+  background: #e8495e;
+}
+
+.theme-pick-glass-amber .theme-pick-preview {
+  background: linear-gradient(160deg, #fff0d4, #ffdfa6);
+  border-color: #f6d492;
+}
+.theme-pick-glass-amber .theme-pick-side {
+  background: #ffd190;
+}
+.theme-pick-glass-amber .theme-pick-main {
+  background: #fff5e2;
+}
+.theme-pick-glass-amber .theme-pick-bar,
+.theme-pick-glass-amber .theme-pick-bubble {
+  background: #ffdfa6;
+}
+.theme-pick-glass-amber .theme-pick-bubble.user {
+  background: #e59a1c;
+}
+
+.theme-pick-glass-cosmos .theme-pick-preview {
+  background: linear-gradient(160deg, #2a2f52, #0b0d18);
+  border-color: #3b4374;
+}
+.theme-pick-glass-cosmos .theme-pick-side {
+  background: #141830;
+}
+.theme-pick-glass-cosmos .theme-pick-main {
+  background: #1b2040;
+}
+.theme-pick-glass-cosmos .theme-pick-bar,
+.theme-pick-glass-cosmos .theme-pick-bubble {
+  background: #3b4374;
+}
+.theme-pick-glass-cosmos .theme-pick-bubble.user {
+  background: #8fa4ff;
+}
+
+/* Chromium in this app is far newer than color-mix(), but keep a flat fallback
+   for anything that cannot parse it. */
+@supports not (color: color-mix(in srgb, red 50%, transparent)) {
+  [data-theme|="glass"] {
+    --glass-panel: var(--surface);
+    --glass-surface: var(--page);
+    --glass-chrome: var(--canvas);
+    --glass-rim: var(--line);
+    --glass-blur: none;
+    --glass-blur-chrome: none;
+    --glass-ground: var(--page);
   }
 }

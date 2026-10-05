@@ -33,6 +33,7 @@ const api: DesktopApi = {
       subscribe<{ version: string; releaseUrl: string }>("app:update-available", listener),
     getLocale: () => ipcRenderer.invoke("app:get-locale"),
     setLocale: (locale: Locale) => ipcRenderer.invoke("app:set-locale", locale),
+    setVibrancy: (material) => ipcRenderer.invoke("window:set-vibrancy", material),
   },
   window: {
     minimize: () => ipcRenderer.invoke("window:minimize"),

@@ -920,16 +920,19 @@ function formatThinkBody(text: string): string {
 
 /** Stop streaming and mark any still-running tools as interrupted when the turn ends abruptly. */
 export function finalizeInterruptedTurn(messages: ChatMessage[]): ChatMessage[] {
-  return messages.map((message, index) => {
-    const last = index === messages.length - 1 && message.role === "assistant";
-    const hadRunning = last && message.tools.some((tool) => tool.status === "running");
+  const now = Date.now();
+  return messages.map((message) => {
+    // 2026-10-05：原来只收尾「最后一条助手消息」里挂着的 running 工具，但它不是最后一个消息时
+    // （压缩条目/后续用户消息把它顶下去、或一次中断留下多个悬空调用）就永远收不了尾 →
+    // 消息卡一直计秒、看起来像会话停不下来。空闲态下任何悬空调用都该收尾。
+    const hadRunning = message.tools.some((tool) => tool.status === "running");
     const tools = hadRunning
       ? message.tools.map((tool) =>
         tool.status === "running"
           ? {
             ...tool,
             status: "error" as const,
-            endedAt: tool.endedAt ?? Date.now(),
+            endedAt: tool.endedAt ?? now,
             output: tool.output?.trim() || ct("error.interrupted"),
           }
           : tool,
@@ -938,6 +941,11 @@ export function finalizeInterruptedTurn(messages: ChatMessage[]): ChatMessage[] 
     if (!message.streaming && !message.queued && !hadRunning) return message;
     return { ...message, streaming: false, queued: false, tools };
   });
+}
+
+/** 消息里是否还挂着 status==="running" 的悬空工具调用（中断/压缩留下的残影）。 */
+export function hasRunningTool(messages: ChatMessage[]): boolean {
+  return messages.some((message) => message.tools.some((tool) => tool.status === "running"));
 }
 
 function mergeWork(current: WorkItem[], incoming: WorkItem[], tools: ToolActivity[]): WorkItem[] {

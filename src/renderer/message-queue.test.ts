@@ -7,7 +7,10 @@ import {
   restoreQueuedPrompt,
   samePathSet,
   shouldDispatchQueuedMessage,
+  shouldReleaseSendLatch,
+  staleRunningSessionKeys,
   type QueuedDispatchState,
+  type SendLatchState,
 } from "./message-queue";
 
 const IDLE: QueuedDispatchState = {
@@ -111,5 +114,85 @@ describe("path set helpers", () => {
   it("temp id 与真实路径不会被当作同一个会话", () => {
     const live = new Set(["/Users/x/.tether/sessions/real.jsonl"]);
     expect(pathSetHas(live, "temp_1712345678")).toBe(false);
+  });
+});
+
+describe("staleRunningSessionKeys", () => {
+  const KEY = "/Users/x/.tether/sessions/stuck.jsonl";
+  const OTHER = "/Users/x/.tether/sessions/live.jsonl";
+
+  it("回归：主进程说空闲，但渲染层缓存粘住 running=true → 连续两轮后回落", () => {
+    const streaks = new Map<string, number>();
+    const cached = [{ key: KEY, running: true }];
+    // 第一次：只记一笔（prompt 刚发出、agent 还没起跑的窗口）
+    expect(staleRunningSessionKeys(cached, new Set(), streaks)).toEqual([]);
+    expect(streaks.get(KEY)).toBe(1);
+    // 第二次：确认主进程两轮都空闲 → 回落
+    expect(staleRunningSessionKeys(cached, new Set(), streaks)).toEqual([KEY]);
+    expect(streaks.has(KEY)).toBe(false);
+  });
+
+  it("主进程说在跑（或中途起跑）就不回落，并把计数清零", () => {
+    const streaks = new Map<string, number>();
+    const cached = [{ key: KEY, running: true }];
+    expect(staleRunningSessionKeys(cached, new Set(), streaks)).toEqual([]);
+    expect(staleRunningSessionKeys(cached, new Set([OTHER, KEY]), streaks)).toEqual([]);
+    expect(streaks.has(KEY)).toBe(false);
+    // 计数被清零后需要重新累计两轮
+    expect(staleRunningSessionKeys(cached, new Set(), streaks)).toEqual([]);
+  });
+
+  it("阈值收紧为 1 时立即回落（真在跑的场景由主进程集合兜底）", () => {
+    const streaks = new Map<string, number>();
+    expect(staleRunningSessionKeys([{ key: KEY, running: true }], new Set(), streaks, 1)).toEqual([KEY]);
+  });
+
+  it("每个会话独立计数：一个真跑、一个粘住", () => {
+    const streaks = new Map<string, number>();
+    const cached = [
+      { key: KEY, running: true },
+      { key: OTHER, running: true },
+    ];
+    expect(staleRunningSessionKeys(cached, new Set([OTHER]), streaks)).toEqual([]);
+    expect(streaks.get(KEY)).toBe(1);
+    expect(streaks.has(OTHER)).toBe(false);
+    expect(staleRunningSessionKeys(cached, new Set([OTHER]), streaks)).toEqual([KEY]);
+  });
+
+  it("已回落的会话不留陈旧计数", () => {
+    const streaks = new Map<string, number>([["gone.jsonl", 1]]);
+    expect(staleRunningSessionKeys([], new Set(), streaks)).toEqual([]);
+    expect(streaks.size).toBe(0);
+  });
+});
+
+describe("send latch release (P0, 2026-10-05)", () => {
+  const base: SendLatchState = {
+    phase: "prompt",
+    elapsedMs: 16_000,
+    stallMs: 15_000,
+    mainBusy: false,
+    landed: false,
+  };
+
+  it("prompt 阶段超时且主进程空闲、消息没落地 → 解闩", () => {
+    expect(shouldReleaseSendLatch(base)).toBe(true);
+  });
+
+  it("冷启动阶段（starting）再久也不解闩：spawn runtime 十几秒是正常耗时", () => {
+    expect(shouldReleaseSendLatch({ ...base, phase: "starting", elapsedMs: 120_000 })).toBe(false);
+    expect(shouldReleaseSendLatch({ ...base, phase: "idle" })).toBe(false);
+  });
+
+  it("主进程还在跑（含长会话的同步压缩）就不解闩", () => {
+    expect(shouldReleaseSendLatch({ ...base, mainBusy: true })).toBe(false);
+  });
+
+  it("消息已经落地（会话消息数增长）就不解闩，避免同一句话发两遍", () => {
+    expect(shouldReleaseSendLatch({ ...base, landed: true })).toBe(false);
+  });
+
+  it("没到时限不解闩", () => {
+    expect(shouldReleaseSendLatch({ ...base, elapsedMs: 15_000 })).toBe(false);
   });
 });

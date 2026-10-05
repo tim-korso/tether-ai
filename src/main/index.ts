@@ -476,14 +476,27 @@ function createWindow(): void {
     minWidth: 880,
     minHeight: 600,
     show: false,
-    backgroundColor: "#fafafb",
+    // macOS: the window itself is a native vibrancy layer (NSVisualEffectView) painted from the
+    // desktop behind the web contents, so the window must not paint a colour of its own — the
+    // renderer decides how much of it shows through (glass theme = translucent ground, the other
+    // three themes keep an opaque body and cover it completely).
+    backgroundColor: process.platform === "darwin" ? "#00000000" : "#fafafb",
     icon: appIconPath(),
     // The Windows controls overlay always paints above page content, so dialogs could never
     // cover it. Going frameless lets the renderer draw its own buttons in normal stacking order.
     ...(process.platform === "darwin"
       ? {
+          // Vibrancy only reaches the desktop when the NSWindow is genuinely non-opaque. Without
+          // this option Electron's NativeWindowMac::OnWidgetInitialized() puts `opaque = YES`
+          // back on the window and the blur just samples the window's own backing store.
+          transparent: true,
+          hasShadow: true,
           titleBarStyle: "hiddenInset" as const,
           trafficLightPosition: { x: 16, y: 14 },
+          // Droppy-Code-style glass: real desktop blur behind the page, kept "active" so the
+          // material does not dim when the window loses focus.
+          vibrancy: "under-window" as const,
+          visualEffectState: "active" as const,
         }
       : {
           frame: false,
@@ -758,6 +771,17 @@ function registerIpc(): void {
     else mainWindow.maximize();
   });
   ipcMain.handle("window:close", () => mainWindow?.close());
+  // macOS-only: the glass family swaps the native NSVisualEffectView material — the light
+  // hues want the pale "under-window" frost, the cosmos night sky wants the dark "hud".
+  // Electron throws on other platforms, so the guard is not optional.
+  ipcMain.handle(
+    "window:set-vibrancy",
+    (_event, material: "under-window" | "hud") => {
+      if (process.platform !== "darwin" || !mainWindow) return;
+      if (material !== "under-window" && material !== "hud") return;
+      mainWindow.setVibrancy(material);
+    },
+  );
 
   ipcMain.handle("workspace:choose", async () => {
     const result = await dialog.showOpenDialog(mainWindow!, {

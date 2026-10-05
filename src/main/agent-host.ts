@@ -7,6 +7,8 @@ import { killProcessTree } from "./process-tree";
 import { drainUtf8Lines } from "./rpc-lines";
 
 interface PendingRequest {
+  /** RPC 类型。`prompt`/`steer`/`compact` 这类长请求在飞时，busy 绝不能被判成空闲。 */
+  type: string;
   resolve(value: unknown): void;
   reject(error: Error): void;
   timeout: NodeJS.Timeout;
@@ -19,6 +21,14 @@ const LONG_RPC_TIMEOUT_MS = 30 * 60_000;
  * 漏一条 agent_settled 就会永久卡死，所以周期性向子进程要权威状态。
  */
 const BUSY_WATCHDOG_MS = 10_000;
+/**
+ * 2026-10-05 P0：同步压缩期间 `isStreaming=false`，但它绝不算空闲——旧判定会在这几十秒里
+ * 连续两轮误判空闲，把在飞的发送抹掉（渲染层回填输入框 → 同一句话发两遍）。
+ * 反向风险同样致命：压缩若真挂死，`isCompacting` 会永远为 true，看门狗就再也回不了头，
+ * 会话变成永久「Waiting for model」，比原来的 bug 更糟。所以压缩只豁免这个上限：
+ * 超过它仍按「卡死」处理，让主进程回落、渲染层解闩，用户不必重启。
+ */
+export const COMPACTION_GRACE_MS = 10 * 60_000;
 const LONG_RUNNING_REQUESTS = new Set([
   "prompt",
   "steer",
@@ -76,6 +86,8 @@ export class AgentHost {
   private busyWatchdog?: NodeJS.Timeout;
   private idleProbeStreak = 0;
   private probing = false;
+  /** 当前同步压缩开始的时刻，用于给压缩一个上限（见 COMPACTION_GRACE_MS）。 */
+  private compactingSince?: number;
   private static readonly STDERR_CAP = 200_000;
   public onSessionResolved?: (resolvedPath: string, previousPath?: string) => void;
   public tempId?: string;
@@ -127,10 +139,8 @@ export class AgentHost {
     }
     this.probing = true;
     try {
-      const state = await this.request<{ isStreaming?: boolean; pendingMessageCount?: number }>("get_state");
-      const streaming = state?.isStreaming;
-      const pending = state?.pendingMessageCount ?? 0;
-      if (streaming === false && pending === 0) {
+      const state = await this.request<RuntimeState>("get_state");
+      if (this.evaluateIdle(state)) {
         this.idleProbeStreak += 1;
         if (this.idleProbeStreak >= 2) this.settleIfStale();
       } else {
@@ -142,6 +152,40 @@ export class AgentHost {
     } finally {
       this.probing = false;
     }
+  }
+
+  /**
+   * 子进程状态 → 「这一轮是否真的结束」。
+   *
+   * 压缩进行中一律算忙，但不无限期算忙：`compactingSince` 超过 COMPACTION_GRACE_MS 之后按
+   * 卡死处理（只看 isStreaming/pending），否则挂死的压缩会把这个会话永久钉在 busy。
+   */
+  private evaluateIdle(state: RuntimeState | undefined): boolean {
+    if (!state) return false;
+    // 2026-10-05 P0-b：RPC 在飞 = 这一轮有账没结，比看 state 硬。
+    // `prompt` 要等整轮跑完才返回；它挂着的时候 get_state 可能短暂报 isStreaming=false
+    // （同步压缩正好在 preflight 里），只看 state 就会把在飞的消息抹掉。
+    if (this.hasInFlightLongRequest()) return false;
+    if (isCompactionRunning(state)) {
+      const now = Date.now();
+      this.compactingSince ??= now;
+      if (now - this.compactingSince < COMPACTION_GRACE_MS) return false;
+    } else {
+      this.compactingSince = undefined;
+    }
+    return isRuntimeIdle(state) || (state.isStreaming === false && (state.pendingMessageCount ?? 0) === 0);
+  }
+
+  /**
+   * 有「长请求」在飞？`prompt`/`steer`/`compact`/`fork` 这类 RPC 在返回前，本轮逻辑上
+   * 就是忙的——它们要么在跑模型，要么在跑压缩。取反才是权威的「可以回落」信号。
+   * 请求表本身有超时兜底（LONG_RPC_TIMEOUT_MS），所以半死的子进程不会把它焊成永真。
+   */
+  private hasInFlightLongRequest(): boolean {
+    for (const pending of this.pending.values()) {
+      if (LONG_RUNNING_REQUESTS.has(pending.type)) return true;
+    }
+    return false;
   }
 
   /** 子进程已确认空闲但本地 busy 还是 true：回落并补一条 agent_settled，让渲染层本地 running 一起归位。 */
@@ -204,7 +248,14 @@ export class AgentHost {
     }
     // 2026-10-03 P0：子进程的 isStreaming 才是运行态权威（= agent-session 的 _isAgentRunActive）。
     // 每次快照对账一次：开/切会话本身就带着一次真实查询，顺手把脱节的本地标志拉回。
-    const authoritative = typeof state.isStreaming === "boolean" ? state.isStreaming : undefined;
+    // 2026-10-05 P0：isCompacting 必须一起看。超长会话发送时的同步压缩跑在 preflight 里
+    // （`_isAgentRunActive` 那时还是 false），只看 isStreaming 会把「正在压缩」当成空闲，
+    // 把 busy 抹掉 → 渲染层以为这一轮结束了（输入框被回填、乐观消息被删、同一句话发两遍）。
+    const streaming = typeof state.isStreaming === "boolean" ? state.isStreaming : undefined;
+    const authoritative =
+      streaming === undefined
+        ? undefined
+        : streaming || isCompactionRunning(state) || this.hasInFlightLongRequest();
     if (authoritative !== undefined && authoritative !== this.busy) {
       this.busy = authoritative;
       if (authoritative) this.armBusyWatchdog();
@@ -395,6 +446,7 @@ export class AgentHost {
         reject(new Error(`Tether did not respond to ${type}. ${this.stderr}`.trim()));
       }, timeoutForRequest(type));
       this.pending.set(id, {
+        type,
         resolve: (value) => resolve(value as T),
         reject,
         timeout,
@@ -491,4 +543,33 @@ function timeoutForRequest(type: string): number {
 function sessionFileFromUnknown(value: unknown): string | undefined {
   if (!value || typeof value !== "object" || !("sessionFile" in value)) return undefined;
   return typeof value.sessionFile === "string" ? value.sessionFile : undefined;
+}
+
+/** 子进程 `get_state` 里与「这一轮是否还在跑」相关的字段。 */
+export interface RuntimeState {
+  isStreaming?: boolean;
+  pendingMessageCount?: number;
+  /** `session.prompt` 的 preflight 会同步跑压缩：那时 isStreaming 还是 false，但绝不能当空闲。 */
+  isCompacting?: boolean;
+}
+
+/** 压缩可能在 preflight 里跑（isStreaming=false），单独判定，避免把压缩当空闲。 */
+export function isCompactionRunning(value: unknown): boolean {
+  return Boolean(value) && typeof value === "object" && (value as RuntimeState).isCompacting === true;
+}
+
+/**
+ * 权威空闲判定：流式、排队消息、同步压缩任一为真都不算空闲。
+ *
+ * 2026-10-05 P0 实测：长会话（上下文接近阈值）每次发送都会在 preflight 里跑一次同步压缩，
+ * 期间 `isStreaming=false && pendingMessageCount=0`，旧判定（只看这两个字段）连续两轮就
+ * 误判空闲 → `settleIfStale()` 抹掉 busy → 渲染层解闩并把在飞的消息退回输入框 → 同一句话发两遍。
+ */
+export function isRuntimeIdle(state: RuntimeState | undefined): boolean {
+  if (!state) return false;
+  return (
+    state.isStreaming === false &&
+    (state.pendingMessageCount ?? 0) === 0 &&
+    state.isCompacting !== true
+  );
 }
