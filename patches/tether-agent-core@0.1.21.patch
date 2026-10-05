@@ -1,5 +1,4 @@
 diff --git a/dist/checkpoint.js b/dist/checkpoint.js
-index 27b60f63a9aa81e01cfa70be0efc87d6e7750e5f..36b7ca997dd5ec50a7f1873cb528fe47dd60af8a 100644
 --- a/dist/checkpoint.js
 +++ b/dist/checkpoint.js
 @@ -1,6 +1,44 @@
@@ -260,10 +259,12 @@ index 27b60f63a9aa81e01cfa70be0efc87d6e7750e5f..36b7ca997dd5ec50a7f1873cb528fe47
  }
  function missingSnapshot(file) {
      return { path: file, content: null, hash: hash(null) };
-@@ -159,4 +257,169 @@ function missingSnapshot(file) {
+@@ -159,4 +257,168 @@ function missingSnapshot(file) {
  function hash(content) {
      return crypto.createHash("sha256").update(content === null ? "\0missing" : content).digest("hex");
  }
+-//# sourceMappingURL=checkpoint.js.map
+\ No newline at end of file
 +// ---------------------------------------------------------------------------
 +// P1：checkpoint 载荷外置（sidecar store）
 +//
@@ -428,10 +429,8 @@ index 27b60f63a9aa81e01cfa70be0efc87d6e7750e5f..36b7ca997dd5ec50a7f1873cb528fe47
 +        bytes += Buffer.byteLength(checkpoint.patch, "utf8");
 +    return bytes;
 +}
- //# sourceMappingURL=checkpoint.js.map
-+
++//# sourceMappingURL=checkpoint.js.map
 diff --git a/dist/home.js b/dist/home.js
-index a0e345a04b9f43b9db1d5b5feb70e171fbeae38a..b2051b619833238cf6d36643d9b92d1a7c1a33ee 100644
 --- a/dist/home.js
 +++ b/dist/home.js
 @@ -68,15 +68,14 @@ export async function partitionSessionFile(file) {
@@ -458,7 +457,6 @@ index a0e345a04b9f43b9db1d5b5feb70e171fbeae38a..b2051b619833238cf6d36643d9b92d1a
          return { runtimePath, storagePath };
      }
 diff --git a/dist/state.js b/dist/state.js
-index 79edb64c87bea6cd99cf21dbf4ffb639b1f9a198..716a9bf8c4ef23f68768bef448c827596a1b871b 100644
 --- a/dist/state.js
 +++ b/dist/state.js
 @@ -65,10 +65,20 @@ export class TetherStateStore {
@@ -672,7 +670,7 @@ index 79edb64c87bea6cd99cf21dbf4ffb639b1f9a198..716a9bf8c4ef23f68768bef448c82759
  function rowToThread(row) {
      return {
          id: row.id,
-@@ -286,69 +458,84 @@ function rowToThread(row) {
+@@ -286,6 +458,20 @@ function rowToThread(row) {
          archived: Boolean(row.archived),
      };
  }
@@ -693,72 +691,14 @@ index 79edb64c87bea6cd99cf21dbf4ffb639b1f9a198..716a9bf8c4ef23f68768bef448c82759
  async function directJsonlFiles(directory) {
      try {
          return (await fs.readdir(directory, { withFileTypes: true }))
-             .filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
-             .map((entry) => path.join(directory, entry.name));
-     }
-     catch (error) {
-         if (isNodeError(error) && error.code === "ENOENT")
-             return [];
-         throw error;
-     }
- }
- async function recursiveJsonlFiles(directory) {
-     let entries;
-     try {
-         entries = await fs.readdir(directory, { withFileTypes: true });
-     }
-     catch (error) {
-         if (isNodeError(error) && error.code === "ENOENT")
-             return [];
-         throw error;
-     }
-     const files = [];
-     for (const entry of entries) {
-         const child = path.join(directory, entry.name);
-         if (entry.isDirectory())
-             files.push(...(await recursiveJsonlFiles(child)));
-         else if (entry.isFile() && entry.name.endsWith(".jsonl"))
-             files.push(child);
-     }
-     return files;
- }
- function parseLine(line) {
-     try {
-         const parsed = JSON.parse(line);
-         return isRecord(parsed) ? parsed : undefined;
-     }
-     catch {
-         return undefined;
-     }
- }
- function messageText(content) {
-     if (typeof content === "string")
-         return normalize(content);
-     if (!Array.isArray(content))
-         return undefined;
-     const text = content
-         .filter(isRecord)
-         .filter((item) => item.type === "text" && typeof item.text === "string")
-         .map((item) => item.text)
-         .join("\n");
-     return text ? normalize(text) : undefined;
- }
- function normalize(value) {
-     return value.replace(/\s+/gu, " ").trim();
- }
- function crop(value, length) {
-     return value.length > length ? `${value.slice(0, length - 1)}…` : value;
- }
- function isRecord(value) {
-     return typeof value === "object" && value !== null && !Array.isArray(value);
- }
+@@ -351,4 +537,4 @@ function isRecord(value) {
  function isNodeError(error) {
      return error instanceof Error && "code" in error;
  }
- //# sourceMappingURL=state.js.map
-+
+-//# sourceMappingURL=state.js.map
+\ No newline at end of file
++//# sourceMappingURL=state.js.map
 diff --git a/dist/tether-extension.js b/dist/tether-extension.js
-index a095d9f5a937d1e924fc536028020942c2c12bf0..17e2223a63c6b94cc099b8ffad36ac219642892b 100644
 --- a/dist/tether-extension.js
 +++ b/dist/tether-extension.js
 @@ -3,7 +3,7 @@ import { Type } from "typebox";
@@ -976,9 +916,21 @@ index a095d9f5a937d1e924fc536028020942c2c12bf0..17e2223a63c6b94cc099b8ffad36ac21
                  },
              });
              pi.registerCommand("jobs", {
-@@ -792,6 +900,15 @@ function deepSeekThinkingLevelMap(modelId) {
+@@ -791,7 +899,27 @@ function deepSeekThinkingLevelMap(modelId) {
+     }
      return { ...base, xhigh: "high", max: "max" };
  }
++// [tether-patch 2026-10-05 P0-b] 逐模型上下文窗口表。
++// 历史写法把 options.modelId 之外的每个模型（临时注入的、extraModelIds 带来的）
++// 一律套 DEEPSEEK_CONTEXT_WINDOW(512k)。对「借 deepseek provider 槽位注册的第三方
++// 模型」这是硬伤：longcat-2.5-preview-free 真实容量 1,000,000，被写成 512k 后
++// 压缩阈值 = 512k − reserveTokens，reserve 一旦 ≥ 512k 阈值就 ≤ 0 → 每轮必压缩。
++// 这里按裸 id 给准确窗口；未列出的仍回落 DEEPSEEK_CONTEXT_WINDOW，且 models.json
++// 的 modelOverrides 依旧按裸 id 覆盖（优先级更高，见 provider-composer）。
++const MODEL_CONTEXT_WINDOWS = {
++    "longcat-2.5-preview-free": 1_000_000,
++};
++const contextWindowForModel = (id) => MODEL_CONTEXT_WINDOWS[id] ?? DEEPSEEK_CONTEXT_WINDOW;
  function registerDeepSeekProvider(pi, options) {
 +    // [tether-patch 2026-10-03b] 模型 id 归一化：CLI/下拉候选/旧会话缓存会把
 +    // "deepseek/xxx" 这种带 provider 前缀的 id 送进来。带前缀的 id 会以「原样」
@@ -992,7 +944,7 @@ index a095d9f5a937d1e924fc536028020942c2c12bf0..17e2223a63c6b94cc099b8ffad36ac21
      const api = options.transport === "responses"
          ? "openai-responses"
          : "openai-completions";
-@@ -813,21 +930,23 @@ function registerDeepSeekProvider(pi, options) {
+@@ -813,21 +941,23 @@ function registerDeepSeekProvider(pi, options) {
          },
      ];
      if (options.providerId === "deepseek" &&
@@ -1022,7 +974,16 @@ index a095d9f5a937d1e924fc536028020942c2c12bf0..17e2223a63c6b94cc099b8ffad36ac21
              cost: defaultCost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
          });
      }
-@@ -878,7 +997,7 @@ function registerDeepSeekProvider(pi, options) {
+@@ -850,7 +980,7 @@ function registerDeepSeekProvider(pi, options) {
+                     ? ["text", "image"]
+                     : ["text"],
+                 cost: model.cost,
+-                contextWindow: DEEPSEEK_CONTEXT_WINDOW,
++                contextWindow: contextWindowForModel(model.id),
+                 maxTokens: resolveMaxTokens(options.baseUrl, options.maxTokens),
+                 ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+                 compat: options.transport === "responses"
+@@ -878,7 +1008,7 @@ function registerDeepSeekProvider(pi, options) {
          }),
      });
  }
@@ -1031,7 +992,7 @@ index a095d9f5a937d1e924fc536028020942c2c12bf0..17e2223a63c6b94cc099b8ffad36ac21
      pi.registerTool({
          name: "exec_command",
          label: "Execute command",
-@@ -937,8 +1056,7 @@ function registerCommandTools(pi, registry, checkpoints, getPermission, accessCo
+@@ -937,8 +1067,7 @@ function registerCommandTools(pi, registry, checkpoints, getPermission, accessCo
                      return currentResult;
                  });
                  if (checkpoint && !result.running) {
@@ -1041,7 +1002,7 @@ index a095d9f5a937d1e924fc536028020942c2c12bf0..17e2223a63c6b94cc099b8ffad36ac21
                  }
                  return {
                      content: [{ type: "text", text: formatManagedResult(result) }],
-@@ -1050,7 +1168,7 @@ async function requestCommandAccess(boundary, command, ctx, permission, current,
+@@ -1050,7 +1179,7 @@ async function requestCommandAccess(boundary, command, ctx, permission, current,
      }
      throw new Error(`User denied ${boundaryLabel} for: ${oneLine(command, 120)}`);
  }
@@ -1050,7 +1011,7 @@ index a095d9f5a937d1e924fc536028020942c2c12bf0..17e2223a63c6b94cc099b8ffad36ac21
      pi.registerTool({
          name: "apply_patch",
          label: "Apply patch",
-@@ -1070,8 +1188,7 @@ function registerPatchTool(pi, checkpoints) {
+@@ -1070,8 +1199,7 @@ function registerPatchTool(pi, checkpoints) {
              const checkpoint = await capturePatchCheckpoint(workspace, params.input, async () => {
                  applied = await applyWorkspacePatch(workspace, params.input);
              });
@@ -1060,7 +1021,7 @@ index a095d9f5a937d1e924fc536028020942c2c12bf0..17e2223a63c6b94cc099b8ffad36ac21
              const result = applied;
              return {
                  content: [
-@@ -1163,156 +1280,161 @@ function registerEntryRenderers(pi) {
+@@ -1163,7 +1291,11 @@ function registerEntryRenderers(pi) {
          const files = entry.data.before.map((file) => file.path).join(", ");
          return new Text([
              `${theme.fg("success", "✓ checkpoint")} ${entry.data.id} ${theme.fg("muted", files)}`,
@@ -1073,159 +1034,15 @@ index a095d9f5a937d1e924fc536028020942c2c12bf0..17e2223a63c6b94cc099b8ffad36ac21
          ].join("\n"), 0, 0);
      });
      pi.registerEntryRenderer(CHECKPOINT_UNDO_ENTRY, (entry, _options, theme) => entry.data
-         ? new Text(`${theme.fg("warning", "↶ undo")} ${entry.data.checkpointId}`, 0, 0)
-         : undefined);
-     pi.registerEntryRenderer(DIFF_ENTRY, (entry, _options, theme) => entry.data
-         ? new Text(`${brandBlue(`diff ${entry.data.checkpointId}`, theme)}\n${colorPatch(entry.data.patch, theme)}`, 0, 0)
-         : undefined);
- }
- function restoreCheckpointState(entries, checkpoints, undone) {
-     for (const entry of entries) {
-         if (entry.type !== "custom")
-             continue;
-         if (entry.customType === CHECKPOINT_ENTRY && isCheckpoint(entry.data)) {
-             checkpoints.push(entry.data);
-         }
-         else if (entry.customType === CHECKPOINT_UNDO_ENTRY &&
-             isRecord(entry.data) &&
-             typeof entry.data.checkpointId === "string") {
-             undone.add(entry.data.checkpointId);
-         }
-     }
- }
- function isCheckpoint(value) {
-     return (isRecord(value) &&
-         typeof value.id === "string" &&
-         typeof value.patch === "string" &&
-         Array.isArray(value.before) &&
-         Array.isArray(value.after));
- }
- function approvalSummary(tool, input) {
-     if (!isRecord(input))
-         return `Tool: ${tool}`;
-     if (tool === "apply_patch" && typeof input.input === "string") {
-         return `${summarizePatch(input.input)}\n\n${input.input.slice(0, 8_000)}`;
-     }
-     if (tool === "exec_command" && typeof input.cmd === "string")
-         return input.cmd;
-     return JSON.stringify(input, null, 2).slice(0, 8_000);
- }
- function summarizePatch(input) {
-     const files = input.split("\n").flatMap((line) => {
-         const match = /^\*\*\* (?:Add File|Delete File|Update File|Move to): (.+)$/.exec(line);
-         return match?.[1] ? [match[1]] : [];
-     });
-     const additions = input
-         .split("\n")
-         .filter((line) => line.startsWith("+")).length;
-     const deletions = input
-         .split("\n")
-         .filter((line) => line.startsWith("-")).length;
-     return `${[...new Set(files)].join(", ") || "patch"} (+${additions} -${deletions})`;
- }
- function patchApprovalSections(input) {
-     const lines = input.replaceAll("\r\n", "\n").split("\n");
-     const sections = [];
-     let current;
-     for (const line of lines) {
-         const match = /^\*\*\* (?:Add File|Delete File|Update File): (.+)$/.exec(line);
-         if (match?.[1]) {
-             if (current)
-                 sections.push(current);
-             current = { file: match[1], lines: [line] };
-             continue;
-         }
-         if (!current || line === "*** Begin Patch" || line === "*** End Patch")
-             continue;
-         current.lines.push(line);
-     }
-     if (current)
-         sections.push(current);
-     if (sections.length === 0) {
-         return [{ file: "patch", patch: input.slice(0, 8_000) }];
-     }
-     return sections.map((section) => ({
-         file: section.file,
-         patch: section.lines.join("\n").slice(0, 8_000),
-     }));
- }
- function colorPatch(patch, theme) {
-     return patch
-         .split("\n")
-         .map((line) => {
-         if (line.startsWith("+"))
-             return theme.fg("toolDiffAdded", line);
-         if (line.startsWith("-"))
-             return theme.fg("toolDiffRemoved", line);
-         return theme.fg("toolDiffContext", line);
-     })
-         .join("\n");
- }
- function formatManagedResult(result, live = false) {
-     const output = clipForModel(result.output.trimEnd() || (live ? "…" : "(no output)"), live ? 4_000 : 6_000);
-     return [
-         output,
-         `process_id: ${result.processId}`,
-         `status: ${result.running ? "running" : "completed"}`,
-         ...(result.running ? ["Use write_stdin to poll or interact."] : []),
-         ...(result.exitCode === undefined ? [] : [`exit_code: ${result.exitCode}`]),
-         ...(result.timedOut ? ["timed_out: true"] : []),
-         `sandbox: ${result.sandbox}`,
-     ].join("\n");
- }
- export function engineeringInstructions(projectCommands, access, runtime) {
-     const commandSandbox = sandboxDescription({
-         mode: access.sandbox,
-         network: access.network,
-     });
-     const rawModelId = runtime.modelId.trim();
-     const providerPattern = runtime.provider
-         ? new RegExp(`^(?:${runtime.provider}|deepseek)/`, "i")
-         : /^deepseek\//i;
-     const cleanModelId = rawModelId.replace(providerPattern, "");
-     const rawModelName = runtime.modelName?.trim();
-     const cleanModelName = rawModelName
-         ? rawModelName.replace(providerPattern, "")
-         : undefined;
-     const modelLabel = cleanModelName && cleanModelName !== cleanModelId
-         ? `${cleanModelId} (${cleanModelName})`
-         : cleanModelId;
-     const instructions = [
-         "# Tether Runtime engineering contract",
-         `- Active runtime model: ${modelLabel} via ${runtime.transport} (${runtime.baseUrl}).`,
-         "- You are Tether, the coding assistant in this workspace. When asked what model you are or which API model is in use, answer briefly with the active runtime model above without any provider prefix (such as deepseek/).",
-         "- Work to a verified repository outcome: inspect first, make focused changes, run the narrowest relevant checks, then broaden validation in proportion to risk.",
-         "- When a check fails, diagnose the evidence and keep repairing while a safe in-scope next step remains. Never hide, truncate in prose, or reinterpret a failing exit code as success.",
-         "- Before changing files below nested directories, discover applicable AGENTS.md and CLAUDE.md files and obey them from broadest to most specific scope.",
-         "- Preserve user changes and unrelated dirty-worktree edits. Never use destructive Git recovery commands unless explicitly requested.",
-         ...shellPromptRules(),
-         "- Use apply_patch for focused writes so changes are checkpointed and undoable.",
-         "- Use update_plan for complex multi-step work. Keep at most one step in_progress. After a step is verified, call update_plan once before starting the next — never batch several update_plan calls at the end of the turn.",
-         "- Use delegate only when 2+ independent subtasks each need a long read-only or isolated implement pass; never delegate a single repo walk or one directory.",
-         "- Prefer read_file/list_files/search_files for one-path exploration; delegate explorers only for parallel modules.",
-         `- Commands execute locally in ${commandSandbox}; this is the Tether Runtime OS sandbox, not a model-provider cloud sandbox.`,
-         `- Command network access is ${access.network ? "enabled" : "disabled until the user grants scoped access"}; do not work around this boundary.`,
-         ...(access.network
-             ? []
-             : [
-                 "- Loopback preview servers (127.0.0.1 / localhost) are allowed inside the sandbox so the user can open them in a browser. Do not tell the user a preview URL works unless the process is actually listening. Outbound internet still needs a network grant.",
-                 "- Tether Runtime handles recognized network and sandbox denials with an allow-once / allow-for-session / deny prompt and retries approved commands automatically. If the user denies access, report that decision; do not suggest bypassing the sandbox.",
-             ]),
-         "- Keep the final answer evidence-based: changed files, checks actually run, failures or limitations, and the shortest useful next action.",
-     ];
-     if (projectCommands.length > 0) {
-         instructions.push("- Detected project commands (inspect their definitions before relying on them):", ...projectCommands.map((command) => `  - ${command}`));
-     }
-     return instructions.join("\n");
- }
+@@ -1315,4 +1447,4 @@ export function engineeringInstructions(projectCommands, access, runtime) {
  function isRecord(value) {
      return typeof value === "object" && value !== null && !Array.isArray(value);
  }
- //# sourceMappingURL=tether-extension.js.map
-+
+-//# sourceMappingURL=tether-extension.js.map
+\ No newline at end of file
++//# sourceMappingURL=tether-extension.js.map
 diff --git a/dist/v4-anchor.js b/dist/v4-anchor.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..7719b52b6b9f06929ea9e90af325067c6ecf0d56
 --- /dev/null
 +++ b/dist/v4-anchor.js
 @@ -0,0 +1,626 @@

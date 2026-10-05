@@ -10,9 +10,9 @@ last newline is missing. Newly added files (`diff --git ... @@ -0,0 +1,N @@`)
 go through a different code path and DO keep their trailing newline.
 
 Practical impact: `tether-patches-20260920/install-tether-build.sh` compares
-sha256 prefixes of the installed files, so a patch that silently drops one
-trailing newline makes that check fail. This script makes the patch reproduce
-the intended bytes exactly instead of weakening the check.
+sha256 prefixes of the node_modules files. A patch that drops one trailing
+newline silently moves the hash and makes the installer `exit 2`. Rather than
+weaken the check, this script makes the patch reproduce the intended bytes.
 
 How: it appends one empty added line to the LAST hunk of each listed file
 (extending that hunk to EOF with context lines first when the hunk stops before
@@ -26,7 +26,7 @@ Usage
 Example
 -------
   scripts/fix-pnpm-patch-eof.py patches/tether-agent-core@0.1.21.patch \
-      dist/checkpoint.js=/path/to/patched/checkpoint.js
+      dist/checkpoint.js=$HOME/tether-patches-20260922/patched/checkpoint.js
 
 Idempotent: already-normalized files are skipped (prints "skip (already ok)").
 Targets whose canonical file has no trailing newline are skipped as well.
